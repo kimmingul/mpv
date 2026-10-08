@@ -46,6 +46,7 @@
 #include "demux.h"
 #include "packet_pool.h"
 #include "timeline.h"
+#include "nanum/nanum.h"
 #include "stheader.h"
 #include "cue.h"
 
@@ -298,6 +299,12 @@ struct demux_internal {
     int dumper_status;
 
     bool owns_stream;
+
+    // NanumPlayer AI subtitle bridge. NULL unless --nanum is set and this is
+    // the top-level demuxer.
+    struct nanum *nanum;
+    struct sh_stream *nanum_sh;     // virtual "ko (AI)" ASS stream
+    struct nanum_cursor nanum_cur;
 
     // -- Access from demuxer thread only
     bool enable_recording;
@@ -2326,6 +2333,28 @@ static bool lazy_stream_needs_wait(struct demux_stream *ds)
             in->demux_ts <= ds->force_read_until);
 }
 
+// NanumPlayer: queue the AI subtitle events that lie in the already demuxed
+// region. add_packet_locked() silently drops packets of unselected streams
+// and while seeking/refreshing, so the cursor must not advance in those cases.
+static void nanum_inject_locked(struct demux_internal *in)
+{
+    struct sh_stream *sh = in->nanum_sh;
+    if (!sh || !sh->ds->selected || sh->ds->refreshing || in->seeking ||
+        in->demux_ts == MP_NOPTS_VALUE)
+        return;
+
+    // add_packet_locked() overwrites demux_ts with each packet's timestamp;
+    // subtitle packets lie behind the read position and must not move it.
+    double demux_ts = in->demux_ts;
+    double from = in->nanum_cur.from != MP_NOPTS_VALUE ? in->nanum_cur.from
+                                                       : demux_ts;
+    struct demux_packet *dp;
+    while ((dp = nanum_next_packet(in->nanum, in->packet_pool, sh->index,
+                                   &in->nanum_cur, from, demux_ts)))
+        add_packet_locked(sh, dp);
+    in->demux_ts = demux_ts;
+}
+
 // Returns true if there was "progress" (lock was released temporarily).
 static bool read_packet(struct demux_internal *in)
 {
@@ -2451,7 +2480,11 @@ static bool read_packet(struct demux_internal *in)
 
     if (pkt) {
         mp_assert(pkt->stream >= 0 && pkt->stream < in->num_streams);
+        if (in->nanum)
+            nanum_tap(in->nanum, in->streams[pkt->stream], pkt);
         add_packet_locked(in->streams[pkt->stream], pkt);
+        if (in->nanum)
+            nanum_inject_locked(in);
     }
 
     if (!in->seeking) {
@@ -2630,6 +2663,9 @@ static void execute_seek(struct demux_internal *in)
 
     if (in->recorder)
         mp_recorder_mark_discontinuity(in->recorder);
+
+    if (in->nanum)
+        nanum_cursor_reset(&in->nanum_cur, pts);
 
     mp_mutex_unlock(&in->lock);
 
@@ -3522,6 +3558,17 @@ struct parent_stream_info {
     char *server_filename;
 };
 
+static void nanum_attach(struct demux_internal *in)
+{
+    struct nanum *n = nanum_create(in, in->global, in->log);
+    if (!n)
+        return;
+    in->nanum = n;
+    nanum_cursor_reset(&in->nanum_cur, MP_NOPTS_VALUE);
+    in->nanum_sh = nanum_alloc_stream(n);
+    demux_add_sh_stream(in->d_thread, in->nanum_sh);
+}
+
 static struct demuxer *open_given_type(struct mpv_global *global,
                                        struct mp_log *log,
                                        const struct demuxer_desc *desc,
@@ -3643,6 +3690,9 @@ static struct demuxer *open_given_type(struct mpv_global *global,
                 }
             }
         }
+
+        if (params && params->is_top_level)
+            nanum_attach(in);
 
         switch_to_fresh_cache_range(in);
 

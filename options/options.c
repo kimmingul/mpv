@@ -71,6 +71,7 @@ extern const struct m_sub_options demux_rawvideo_conf;
 extern const struct m_sub_options demux_playlist_conf;
 extern const struct m_sub_options demux_lavf_conf;
 extern const struct m_sub_options demux_mkv_conf;
+extern const struct m_sub_options nanum_conf;
 #if HAVE_SUBRANDR
 extern const struct m_sub_options demux_sbr_conf;
 #endif
@@ -720,6 +721,7 @@ static const m_option_t mp_opts[] = {
     {"demuxer-rawaudio", OPT_SUBSTRUCT(demux_rawaudio, demux_rawaudio_conf)},
     {"demuxer-rawvideo", OPT_SUBSTRUCT(demux_rawvideo, demux_rawvideo_conf)},
     {"", OPT_SUBSTRUCT(demux_playlist, demux_playlist_conf)},
+    {"", OPT_SUBSTRUCT(nanum, nanum_conf)},
     {"demuxer-mkv", OPT_SUBSTRUCT(demux_mkv, demux_mkv_conf)},
 #if HAVE_SUBRANDR
     {"demuxer-sbr", OPT_SUBSTRUCT(demux_sbr, demux_sbr_conf)},

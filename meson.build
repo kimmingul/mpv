@@ -92,6 +92,9 @@ sources = files(
     'common/version.c',
 
     ## Demuxers
+    ## NanumPlayer
+    'nanum/nanum.c',
+
     'demux/codec_tags.c',
     'demux/cue.c',
     'demux/cache.c',
