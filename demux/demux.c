@@ -305,6 +305,7 @@ struct demux_internal {
     struct nanum *nanum;
     struct sh_stream *nanum_sh;     // virtual "ko (AI)" ASS stream
     struct nanum_cursor nanum_cur;
+    bool nanum_wakeup;              // AI events arrived: demux thread injects
 
     // -- Access from demuxer thread only
     bool enable_recording;
@@ -1133,6 +1134,9 @@ int demux_get_num_stream(struct demuxer *demuxer)
 static void demux_shutdown(struct demux_internal *in)
 {
     struct demuxer *demuxer = in->d_user;
+
+    // Stops the AI threads; they take in->lock through the wakeup callback.
+    nanum_shutdown(in->nanum);
 
     if (in->recorder) {
         mp_recorder_destroy(in->recorder);
@@ -2343,14 +2347,19 @@ static void nanum_inject_locked(struct demux_internal *in)
         in->demux_ts == MP_NOPTS_VALUE)
         return;
 
+    // Speech recognition lags behind the demuxer, so events usually arrive
+    // for times the demuxer already passed: the lower bound is where playback
+    // (re)started (last seek), not the demux position. Once the file is fully
+    // demuxed everything that is left is due.
+    double demux_ts = in->demux_ts;
+    double to = in->eof ? INFINITY : demux_ts;
+    double from = in->nanum_cur.from != MP_NOPTS_VALUE ? in->nanum_cur.from
+                                                       : -INFINITY;
     // add_packet_locked() overwrites demux_ts with each packet's timestamp;
     // subtitle packets lie behind the read position and must not move it.
-    double demux_ts = in->demux_ts;
-    double from = in->nanum_cur.from != MP_NOPTS_VALUE ? in->nanum_cur.from
-                                                       : demux_ts;
     struct demux_packet *dp;
     while ((dp = nanum_next_packet(in->nanum, in->packet_pool, sh->index,
-                                   &in->nanum_cur, from, demux_ts)))
+                                   &in->nanum_cur, from, to)))
         add_packet_locked(sh, dp);
     in->demux_ts = demux_ts;
 }
@@ -2496,6 +2505,8 @@ static bool read_packet(struct demux_internal *in)
                 if (in->wakeup_cb)
                     in->wakeup_cb(in->wakeup_cb_ctx);
                 mp_cond_signal(&in->wakeup);
+                if (in->nanum)
+                    nanum_notify_eof(in->nanum);
                 MP_VERBOSE(in, "EOF reached.\n");
             }
         }
@@ -2664,8 +2675,10 @@ static void execute_seek(struct demux_internal *in)
     if (in->recorder)
         mp_recorder_mark_discontinuity(in->recorder);
 
-    if (in->nanum)
+    if (in->nanum) {
         nanum_cursor_reset(&in->nanum_cur, pts);
+        nanum_notify_seek(in->nanum);
+    }
 
     mp_mutex_unlock(&in->lock);
 
@@ -2779,6 +2792,11 @@ static bool thread_work(struct demux_internal *in)
     }
     if (in->seeking) {
         execute_seek(in);
+        return true;
+    }
+    if (in->nanum_wakeup) {
+        in->nanum_wakeup = false;
+        nanum_inject_locked(in);
         return true;
     }
     if (read_packet(in))
@@ -3558,6 +3576,16 @@ struct parent_stream_info {
     char *server_filename;
 };
 
+// Called from the AI threads when new events are available.
+static void nanum_wakeup_cb(void *p)
+{
+    struct demux_internal *in = p;
+    mp_mutex_lock(&in->lock);
+    in->nanum_wakeup = true;
+    mp_cond_signal(&in->wakeup);
+    mp_mutex_unlock(&in->lock);
+}
+
 static void nanum_attach(struct demux_internal *in)
 {
     struct nanum *n = nanum_create(in, in->global, in->log);
@@ -3565,6 +3593,7 @@ static void nanum_attach(struct demux_internal *in)
         return;
     in->nanum = n;
     nanum_cursor_reset(&in->nanum_cur, MP_NOPTS_VALUE);
+    nanum_set_wakeup(n, nanum_wakeup_cb, in);
     in->nanum_sh = nanum_alloc_stream(n);
     demux_add_sh_stream(in->d_thread, in->nanum_sh);
 }

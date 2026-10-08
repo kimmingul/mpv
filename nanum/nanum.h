@@ -34,6 +34,20 @@ struct nanum_cursor {
 // Returns NULL if --nanum is not enabled.
 struct nanum *nanum_create(void *parent, struct mpv_global *global,
                            struct mp_log *log);
+// Called from the AI thread (and other non-demux threads) whenever new events
+// are available; must be cheap. Set once, before the engine runs.
+void nanum_set_wakeup(struct nanum *n, void (*cb)(void *ctx), void *ctx);
+
+// The demuxer is about to seek: queued audio is obsolete.
+void nanum_notify_seek(struct nanum *n);
+
+// The demuxer reached the end of the stream: analyse what is still buffered.
+void nanum_notify_eof(struct nanum *n);
+
+// Stops all threads and the AI engine. Must be called without the demux lock
+// held and before the demuxer's lock is destroyed. Idempotent.
+void nanum_shutdown(struct nanum *n);
+
 
 // Resets the cursor. Call after every demuxer seek. 'from' is the seek target.
 void nanum_cursor_reset(struct nanum_cursor *c, double from);
