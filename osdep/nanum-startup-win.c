@@ -224,7 +224,7 @@ void nanum_startup_defaults(struct MPContext *mpctx)
 {
     void *tmp = talloc_new(NULL);
 
-    MP_INFO(mpctx, "NanumPlayer 1.6.0 (%s)\n", mpv_version);
+    MP_INFO(mpctx, "NanumPlayer 1.6.1 (%s)\n", mpv_version);
 
     bool configured = false;
     char *settings = settings_dir(tmp, mpctx->global, &configured);

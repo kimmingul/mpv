@@ -1,9 +1,9 @@
 /*
  * NanumPlayer: AI engine selection and the optional CUDA component manager.
  *
- * The CPU engine (nanum_ai_cpu.dll) and the CUDA engine (nanum_ai_cuda.dll)
- * ship with the application. CUDA also needs NVIDIA's cuBLAS runtimes
- * (cublas64_13.dll, cublasLt64_13.dll), which come from
+ * The CPU engine (nanum_ai_cpu.dll) ships with the application. The CUDA engine
+ * (nanum_ai_cuda.dll) is an optional verified download. CUDA also needs NVIDIA's
+ * cuBLAS runtimes (cublas64_13.dll, cublasLt64_13.dll), which come from
  *
  *   toolkit   the bin\x64 / bin folder of an installed, compatible CUDA Toolkit
  *             (CUDA_PATH_V13_*, CUDA_PATH of the process or of the registry's
@@ -12,11 +12,12 @@
  *             or removed, and their folders are never added to a process wide
  *             search path. No license step is needed.
  *   download  %LOCALAPPDATA%\NanumPlayer\accelerators\cuda\<CUDA major>\
- *             (NANUMPLAYER_ACCEL_DIR overrides the base folder), after the
- *             NVIDIA license was accepted. Independent of the app version;
- *             files of the old per-version folders are copied (verified).
+ *             (NANUMPLAYER_ACCEL_DIR overrides the base folder): the engine, and
+ *             cuBLAS after the NVIDIA license was accepted. Independent of the app
+ *             version; files of the old per-version folders are copied (verified).
+ *             An engine that is not the catalog's one counts as missing ("update").
  *
- * Names, sizes, SHA-256 values and pinned HTTPS URLs of the runtimes come from
+ * Names, sizes, SHA-256 values and pinned HTTPS URLs of the components come from
  * <app>\components\catalog.json (schema 1), a file shipped with the
  * application. Downloads reuse the models manager's engine
  * (osdep/nanum-download-win.c): size and digest verified, one .part per

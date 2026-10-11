@@ -2,35 +2,37 @@
  * NanumPlayer: AI engine selection and optional CUDA component manager
  * (Windows). See nanum-accel.h.
  *
- * The CUDA engine nanum_ai_cuda.dll ships with the application (<app>\), like the
- * CPU engine; it is not downloaded. What is optional are NVIDIA's cuBLAS runtimes:
- * cublas -> cublas64_13.dll, cublas_lt -> cublasLt64_13.dll. Their names, sizes,
+ * The CPU engine nanum_ai_cpu.dll ships with the application. Optional downloads are the
+ * CUDA engine (cuda_engine -> nanum_ai_cuda.dll) and NVIDIA's cuBLAS runtimes
+ * (cublas -> cublas64_13.dll, cublas_lt -> cublasLt64_13.dll). Their names, sizes,
  * SHA-256 values and pinned HTTPS URLs come from <app>\components\catalog.json:
  *   { "schema": 1, "cuda_major": 13, "min_compute": 86,
  *     "components": [ {id, label, filename, size, sha256, url}, ... ] }
- * (the catalog is independent of the application version). No remote manifest is
- * ever trusted. Without the catalog nothing CUDA related can be loaded (the CPU
- * engine is not affected).
+ * (the catalog is independent of the application version; a new engine is a new pin).
+ * No remote manifest is ever trusted. Without the catalog nothing CUDA related can be
+ * loaded (the CPU engine is not affected).
  *
- * Where a runtime comes from ("source"):
- *   toolkit  a compatible installed CUDA Toolkit, used in place and never copied
- *            (nothing of NVIDIA's is redistributed, no license step). Found via
- *            CUDA_PATH_V13_* / CUDA_PATH of the process, the same variables in the
- *            registry's environment (HKLM Session Manager\Environment, HKCU
- *            Environment; a Toolkit installed after Explorer started is not in
- *            the inherited environment), and %ProgramFiles%\NVIDIA GPU Computing
+ * Where a component comes from ("source"):
+ *   toolkit  cublas / cublas_lt only: a compatible installed CUDA Toolkit, used in place
+ *            and never copied (nothing of NVIDIA's is redistributed, no license step).
+ *            Found via CUDA_PATH_V13_* / CUDA_PATH of the process, the same variables in
+ *            the registry's environment (HKLM Session Manager\Environment, HKCU
+ *            Environment; a Toolkit installed after Explorer started is not in the
+ *            inherited environment), and %ProgramFiles%\NVIDIA GPU Computing
  *            Toolkit\CUDA\v13.*; newest first. NANUMPLAYER_CUDA_TOOLKIT_ROOT
  *            (tests) replaces all of that by the folder holding v13.* Toolkits.
  *            A Toolkit directory is accepted only if BOTH runtime DLLs have the
  *            catalog's ABI-specific filenames, are x64 DLLs and carry identical
  *            readable vendor file-version resources. The pair comes from ONE directory.
- *   user     %LOCALAPPDATA%\NanumPlayer\accelerators\cuda\<cuda major>\<file>
- *            (downloaded by this manager after the NVIDIA license was accepted,
- *            size-checked, immutable once installed; independent of the app version)
+ *   user     %LOCALAPPDATA%\NanumPlayer\accelerators\cuda\<cuda major>\<file> (engine and
+ *            runtimes; downloaded by this manager, size/SHA-256 verified, independent of
+ *            the app version). cuBLAS is only downloaded after the NVIDIA license was
+ *            accepted (the UI's job); the engine contains nothing of NVIDIA's.
  *   reused   a "user" file copied (no network, size + SHA-256 verified, atomic rename)
  *            from an older per-app-version directory cuda\<version>\ (migration;
  *            marked by <file>.reused)
- *   bundled  the CUDA engine itself, listed in components[] for the UI
+ * The cached engine is hashed once per file identity; a file that is not the catalog's
+ * engine (an older one) counts as missing and sets "update_required".
  *
  * Loading (nanum_accel_load_engine): the runtime DLLs are loaded first, by
  * their full paths with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | SYSTEM32, and the
@@ -54,10 +56,11 @@
  *   received, total bytes of the current file written / hashed / copied, its size
  *   error           message, "" unless status is error
  *   reason          why CUDA is not usable / not used (see below), "" otherwise
- *   download_size   bytes that still have to be downloaded for the runtimes
+ *   download_size   bytes that still have to be downloaded (engine, runtimes)
+ *   update_required an engine is installed (or in an old folder) but it is not the catalog's
  *   catalog, catalog_error, active_backend (extra)
- *   components      [{id, label, filename, size, installed, path, source}]: cuda_engine
- *                   (source "bundled"), cublas, cublas_lt
+ *   components      [{id, label, filename, size, installed, path, source}]: cuda_engine,
+ *                   cublas, cublas_lt (source toolkit | user | reused)
  *
  * Threads: commands and publishing run on the core thread. The single worker
  * does network, file, hash and probe work and talks to the core only by
@@ -105,15 +108,15 @@
 #define DEFAULT_CUDA_MAJOR 13
 #define MAX_OTHER 16
 #define MAX_TK_ROOTS 24
-#define CUDA_ENGINE_FILE "nanum_ai_cuda.dll"
 
-enum { C_CUBLAS, C_CUBLAS_LT, C_COUNT };
+enum { C_ENGINE, C_CUBLAS, C_CUBLAS_LT, C_COUNT };
 
 static const struct {
     const char *id;
     const char *file;
     const char *label;      // used while the catalog is unavailable
 } KNOWN[C_COUNT] = {
+    [C_ENGINE]     = {"cuda_engine", "nanum_ai_cuda.dll", "NanumPlayer CUDA engine"},
     [C_CUBLAS]     = {"cublas",      "cublas64_13.dll",   "NVIDIA cuBLAS"},
     [C_CUBLAS_LT]  = {"cublas_lt",   "cublasLt64_13.dll", "NVIDIA cuBLASLt"},
 };
@@ -168,6 +171,8 @@ static struct {
     int probe_next;
     char last_backend[16];      // backend of the engine loaded last
     bool reuse_tried[C_COUNT];  // components looked for in the other version directories
+    char eng_key[1700];         // identity (path|size|mtime) of the cached engine that was hashed
+    bool eng_good;              // ... and whether it matched the catalog SHA-256
     bool shutting_down;
     bool running;
     enum job_kind running_kind;
@@ -463,9 +468,7 @@ struct scan {
     char *cachedir;
     char *cpu_path;
     bool cpu_ok;
-    char *engine_path;          // the bundled CUDA engine
-    bool engine_ok;
-    int64_t engine_size;
+    char *engine_path;          // the cached CUDA engine (where it is or will be installed)
     struct comp c[C_COUNT];
     struct nanum_dl_fst engine_st;
     struct cand cand[MAX_CAND]; // usable runtime directories, best first
@@ -484,7 +487,10 @@ struct scan {
     } other[MAX_OTHER];
     int nother;
     bool reused[C_COUNT];       // installed by copying from another directory
-    bool reuse_wanted;          // a missing runtime can be copied from another directory
+    bool work_wanted;           // the worker has something to do without network: copy a file
+                                // from another directory, or hash the cached engine once
+    bool update_required;       // an engine is there (or in an old directory) but not the one
+                                // of the catalog
 };
 
 static bool file_has_size(const char *path, int64_t size)
@@ -835,15 +841,8 @@ static void scan_all(void *ctx, struct scan *s)
     s->cachedir = cachedir ? talloc_strdup(ctx, cachedir) : NULL;
     s->cudaroot = cudaroot ? talloc_strdup(ctx, cudaroot) : NULL;
     mp_mutex_unlock(&g_lock);
-
     struct nanum_dl_fst f;
     s->cpu_ok = s->cpu_path && nanum_dl_stat(s->cpu_path, &f) && f.size > 0;
-
-    // The CUDA engine is part of the application, next to the CPU engine.
-    s->engine_path = root ? join(ctx, root, CUDA_ENGINE_FILE) : NULL;
-    s->engine_ok = s->engine_path && nanum_dl_stat(s->engine_path, &s->engine_st) &&
-                   s->engine_st.size > 0;
-    s->engine_size = s->engine_ok ? s->engine_st.size : 0;
 
     bool cache_ok[C_COUNT] = {0};
     for (int i = 0; i < C_COUNT; i++) {
@@ -853,40 +852,65 @@ static void scan_all(void *ctx, struct scan *s)
                       file_has_size(s->c[i].path, s->cat.item[i].size);
     }
 
+    // The engine lives in the cache. Its SHA-256 is checked once per file identity by the worker
+    // (until then the matching size counts); a mismatch means it is an older engine.
+    s->engine_path = s->c[C_ENGINE].path;
+    bool engine_file = nanum_dl_stat(s->engine_path, &s->engine_st);
+    bool engine_unverified = false, engine_bad = false;
+    if (cache_ok[C_ENGINE]) {
+        char key[1700];
+        snprintf(key, sizeof(key), "%s|%" PRId64 "|%" PRIu64, s->engine_path, s->engine_st.size,
+                 s->engine_st.mtime);
+        mp_mutex_lock(&g_lock);
+        bool known = !strcmp(key, g.eng_key);
+        bool good = g.eng_good;
+        mp_mutex_unlock(&g_lock);
+        engine_unverified = !known;
+        engine_bad = known && !good;
+        s->c[C_ENGINE].installed = !engine_bad;
+    }
+
     if (cache_ok[C_CUBLAS] && cache_ok[C_CUBLAS_LT])
         s->cand[s->ncand++] = (struct cand){s->cachedir, false};
     scan_toolkits(s);
 
     if (s->ncand > 0) {
         // The runtime pair comes from the best directory, as a whole.
-        for (int i = 0; i < C_COUNT; i++) {
+        for (int i = C_CUBLAS; i <= C_CUBLAS_LT; i++) {
             s->c[i].installed = true;
             s->c[i].toolkit = s->cand[0].toolkit;
             s->c[i].path = join(ctx, s->cand[0].dir, comp_file(&s->cat, i));
         }
     } else {
-        for (int i = 0; i < C_COUNT; i++)
+        for (int i = C_CUBLAS; i <= C_CUBLAS_LT; i++)
             s->c[i].installed = cache_ok[i];
     }
     for (int i = 0; i < C_COUNT; i++) {
         s->reused[i] = s->c[i].installed && !s->c[i].toolkit &&
                        nanum_dl_stat(marker_path(ctx, s->c[i].path), &f);
     }
-    // Migration from an old per-app-version directory: only needed while nothing else (a
-    // Toolkit, the current directory) provides the pair.
-    if (s->ncand == 0 && s->cat.ok && s->cachedir) {
+    // Migration from an old per-app-version directory: only for what nothing else (the cache,
+    // a Toolkit for the runtimes) provides.
+    bool engine_migrates = false, engine_old = engine_file && !s->c[C_ENGINE].installed;
+    if (s->cat.ok && s->cachedir) {
         scan_other_versions(s);
         for (int i = 0; i < C_COUNT; i++) {
-            for (int k = 0; k < s->nother && !s->c[i].installed && !tried[i]; k++) {
-                if (file_has_size(join(ctx, s->other[k].dir, comp_file(&s->cat, i)),
-                                  s->cat.item[i].size))
-                {
-                    s->reuse_wanted = true;
+            if (s->c[i].installed || tried[i] || (i != C_ENGINE && s->ncand > 0))
+                continue;
+            for (int k = 0; k < s->nother; k++) {
+                char *src = join(ctx, s->other[k].dir, comp_file(&s->cat, i));
+                if (file_has_size(src, s->cat.item[i].size)) {
+                    s->work_wanted = true;
+                    engine_migrates |= i == C_ENGINE;
                     break;
                 }
             }
         }
+        for (int k = 0; k < s->nother && !engine_old; k++)
+            engine_old = nanum_dl_stat(join(ctx, s->other[k].dir, KNOWN[C_ENGINE].file), &f);
     }
+    s->work_wanted |= engine_unverified;
+    s->update_required = s->cat.ok && !s->c[C_ENGINE].installed && engine_old && !engine_migrates;
     if (s->cat.ok) {
         for (int i = 0; i < C_COUNT; i++) {
             if (!s->c[i].installed)
@@ -901,34 +925,45 @@ static char *missing_text(struct scan *s)
     if (!s->cat.ok)
         return talloc_asprintf(s->ctx, "CUDA acceleration is unavailable: %s. Reinstall "
                                "NanumPlayer to restore it.", s->cat.err);
-    if (!s->engine_ok)
-        return talloc_asprintf(s->ctx, "CUDA acceleration is unavailable: the CUDA engine %s "
-                               "is missing from the application folder%s%s. Reinstall "
-                               "NanumPlayer to restore it.", CUDA_ENGINE_FILE,
-                               s->engine_path ? ": " : "", s->engine_path ? s->engine_path : "");
     char *list = NULL;
+    bool runtime_missing = false;
     for (int i = 0; i < C_COUNT; i++) {
         if (s->c[i].installed)
             continue;
+        runtime_missing |= i != C_ENGINE;
         list = list ? talloc_asprintf(s->ctx, "%s, %s", list, s->cat.item[i].file)
                     : talloc_strdup(s->ctx, s->cat.item[i].file);
     }
     if (!list)
         return NULL;
     return talloc_asprintf(s->ctx, "CUDA acceleration is not installed: %s missing (%" PRId64
-                           " MiB to download; %s).", list, mib_up(s->need),
-                           s->tk_note ? s->tk_note : "no compatible CUDA Toolkit was found");
+                           " MiB to download%s%s).", list, mib_up(s->need),
+                           runtime_missing ? "; " : "",
+                           runtime_missing ? (s->tk_note ? s->tk_note
+                                              : "no compatible CUDA Toolkit was found") : "");
 }
 
-// The text for the user while auto mode runs on the CPU for lack of files. What is missing is
-// usually the cuBLAS pair: say how to get it.
+// The text for the user while auto mode runs on the CPU for lack of files.
 static char *auto_notice(struct scan *s)
 {
-    if (s->cat.ok && s->engine_ok && (!s->c[C_CUBLAS].installed || !s->c[C_CUBLAS_LT].installed)) {
-        int64_t pair = s->cat.item[C_CUBLAS].size + s->cat.item[C_CUBLAS_LT].size;
-        return talloc_asprintf(s->ctx, "CUDA 가속: CUDA %d Toolkit을 설치하거나 cuBLAS(약 %" PRId64
-                               " MiB)를 받으세요", s->cat.cuda_major, (pair + (1 << 19)) >> 20);
+    if (!s->cat.ok)
+        return missing_text(s);
+    int64_t engine = (s->cat.item[C_ENGINE].size + (1 << 19)) >> 20;
+    int64_t pair = (s->cat.item[C_CUBLAS].size + s->cat.item[C_CUBLAS_LT].size + (1 << 19)) >> 20;
+    bool runtime = s->c[C_CUBLAS].installed && s->c[C_CUBLAS_LT].installed;
+    if (s->update_required)
+        return talloc_asprintf(s->ctx, "CUDA 엔진 업데이트 필요 (약 %" PRId64 " MiB)", engine);
+    if (!s->c[C_ENGINE].installed) {
+        if (runtime)
+            return talloc_asprintf(s->ctx, "CUDA 가속: 엔진(약 %" PRId64 " MiB)을 받으면 GPU를 "
+                                   "사용합니다", engine);
+        return talloc_asprintf(s->ctx, "CUDA 가속: 엔진(약 %" PRId64 " MiB)과 cuBLAS(약 %" PRId64
+                               " MiB)를 받으면 GPU를 사용합니다 (CUDA %d Toolkit이 있으면 엔진만)",
+                               engine, pair, s->cat.cuda_major);
     }
+    if (!runtime)
+        return talloc_asprintf(s->ctx, "CUDA 가속: CUDA %d Toolkit을 설치하거나 cuBLAS(약 %"
+                               PRId64 " MiB)를 받으세요", s->cat.cuda_major, pair);
     return missing_text(s);
 }
 
@@ -1423,6 +1458,19 @@ struct job {
     struct jcomp c[C_COUNT];
 };
 
+
+// Records that the cached engine in its current form was (or was not) the catalog's file.
+static void eng_mark(const char *path, bool good)
+{
+    struct nanum_dl_fst f;
+    if (!nanum_dl_stat(path, &f))
+        return;
+    mp_mutex_lock(&g_lock);
+    snprintf(g.eng_key, sizeof(g.eng_key), "%s|%" PRId64 "|%" PRIu64, path, f.size, f.mtime);
+    g.eng_good = good;
+    mp_mutex_unlock(&g_lock);
+}
+
 static enum nanum_dl_res process_component(struct jcomp *c)
 {
     struct nanum_dl *dl = &g.dl;
@@ -1441,6 +1489,8 @@ static enum nanum_dl_res process_component(struct jcomp *c)
         if (match) {
             mp_info(g.log, "component '%s': %s is already installed and verified\n",
                     KNOWN[c->idx].id, c->path);
+            if (c->idx == C_ENGINE)
+                eng_mark(c->path, true);
             return NANUM_DL_OK;
         }
     }
@@ -1459,6 +1509,8 @@ static enum nanum_dl_res process_component(struct jcomp *c)
         r = nanum_dl_install(dl, &c->e, c->path, part, &f);
     if (r != NANUM_DL_OK)
         DeleteFileW(W(tmp, part));
+    if (r == NANUM_DL_OK && c->idx == C_ENGINE)
+        eng_mark(c->path, true);
     talloc_free(tmp);
     return r;
 }
@@ -1508,6 +1560,31 @@ static enum nanum_dl_res run_reuse(void)
     enum nanum_dl_res r = NANUM_DL_OK;
     if (!s->cat.ok || !s->cachedir)
         goto out;
+    // The cached engine is hashed once per file identity: a file of the catalog's size that is
+    // not the catalog's file is an older engine.
+    if (s->c[C_ENGINE].installed && file_has_size(s->c[C_ENGINE].path, s->cat.item[C_ENGINE].size)) {
+        char key[1700];
+        snprintf(key, sizeof(key), "%s|%" PRId64 "|%" PRIu64, s->engine_path, s->engine_st.size,
+                 s->engine_st.mtime);
+        mp_mutex_lock(&g_lock);
+        bool known = !strcmp(key, g.eng_key);
+        mp_mutex_unlock(&g_lock);
+        if (!known) {
+            bool match = false;
+            dl->tag = C_ENGINE;
+            set_state(ST_CHECKING, C_ENGINE, 0, s->cat.item[C_ENGINE].size, NULL);
+            r = nanum_dl_hash(dl, &s->cat.item[C_ENGINE], s->engine_path, &match);
+            if (r == NANUM_DL_FAIL) {
+                mp_warn(g.log, "cannot verify %s: %s\n", s->engine_path, dl->err);
+                r = NANUM_DL_OK;
+            } else if (r == NANUM_DL_OK) {
+                eng_mark(s->engine_path, match);
+                if (!match)
+                    mp_warn(g.log, "%s is not the engine of the catalog (older version); "
+                            "update required\n", s->engine_path);
+            }
+        }
+    }
     for (int i = 0; i < C_COUNT && r == NANUM_DL_OK; i++) {
         if (s->c[i].installed)
             continue;
@@ -1740,17 +1817,8 @@ static void publish(struct MPContext *mpctx)
     node_map_add_string(&root, "catalog_error", s->cat.ok ? "" : s->cat.err);
     node_map_add_string(&root, "active_backend", last_backend);
 
+    node_map_add_flag(&root, "update_required", s->update_required);
     mpv_node *arr = node_map_add(&root, "components", MPV_FORMAT_NODE_ARRAY);
-    {
-        mpv_node *m = node_array_add(arr, MPV_FORMAT_NODE_MAP);
-        node_map_add_string(m, "id", "cuda_engine");
-        node_map_add_string(m, "label", "NanumPlayer CUDA 엔진");
-        node_map_add_string(m, "filename", CUDA_ENGINE_FILE);
-        node_map_add_int64(m, "size", s->engine_size);
-        node_map_add_flag(m, "installed", s->engine_ok);
-        node_map_add_string(m, "path", s->engine_path ? s->engine_path : "");
-        node_map_add_string(m, "source", "bundled");
-    }
     for (int i = 0; i < C_COUNT; i++) {
         mpv_node *m = node_array_add(arr, MPV_FORMAT_NODE_MAP);
         node_map_add_string(m, "id", KNOWN[i].id);
@@ -1875,7 +1943,7 @@ void nanum_accel_refresh(struct MPContext *mpctx)
         scan_all(tmp, s);
         char *why;
         enum cuda_state cs = cuda_state_of(s, &why);
-        bool reuse = s->reuse_wanted;
+        bool reuse = s->work_wanted;
         talloc_free(tmp);
         if (reuse || cs == CUDA_UNPROBED) {
             struct job *j = talloc_zero(NULL, struct job);
