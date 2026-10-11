@@ -20,11 +20,11 @@
 
 // NanumPlayer.exe is mpv, modified: AI subtitles, native Windows UI. mpv's
 // licence (GPL v2 or later) and copyright notice are kept in the resources.
-#define NANUM_VERSION "1.6.1"
+#define NANUM_VERSION "1.6.2"
 
 VS_VERSION_INFO VERSIONINFO
-    FILEVERSION 1, 6, 1, 0
-    PRODUCTVERSION 1, 6, 1, 0
+    FILEVERSION 1, 6, 2, 0
+    PRODUCTVERSION 1, 6, 2, 0
     FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
     FILEFLAGS 0
     FILEOS VOS__WINDOWS32
