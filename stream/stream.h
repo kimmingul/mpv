@@ -101,6 +101,7 @@ enum stream_ctrl {
     STREAM_CTRL_SET_STILL_PAGE,      // int*, force the shown still page
     STREAM_CTRL_NAV_DRAIN_ENABLE,    // start holding EOF at jump boundaries
     STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
+    STREAM_CTRL_GET_DISC_IDENTITY,   // char** (talloc'd): disc/title identity text, NanumPlayer library
 };
 
 // Fetch the still image that a disc (DVD-Audio ASVS) associates with the given

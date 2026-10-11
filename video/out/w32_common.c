@@ -61,6 +61,29 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
+// Windows 11 (build 22000+) only; older systems reject these and the calls are
+// ignored.
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+
+// DWMWA_COLOR_DEFAULT: let the system draw the frame colour itself.
+#define NANUM_COLOR_DEFAULT 0xFFFFFFFF
+// NanumPlayer's UI base colour (scripts/nanum-fluent.lua draws the same #14161A),
+// as a COLORREF (0x00BBGGRR). Title bar and border use it so the native frame
+// and the in-window interface read as one surface.
+#define NANUM_CAPTION_COLOR 0x001A1614
+#define NANUM_BORDER_COLOR 0x00332E2A
+#define NANUM_TEXT_COLOR 0x00F2F0EE
+
 #ifndef DWMWA_VISIBLE_FRAME_BORDER_THICKNESS
 #define DWMWA_VISIBLE_FRAME_BORDER_THICKNESS 37
 #endif
@@ -1161,30 +1184,38 @@ static void update_corners_pref(const struct vo_w32_state *w32)
                           &pref, sizeof(pref));
 }
 
-// Follow Windows settings and update dark mode state
-// Microsoft documented how to enable dark mode for title bar:
+// NanumPlayer always uses the dark title bar/frame (the interface is dark).
+// DWMWA_USE_IMMERSIVE_DARK_MODE darkens the caption, the UxTheme call also
+// darkens the window's menus and scrollbars:
 // https://learn.microsoft.com/windows/apps/desktop/modernize/apply-windows-themes
 // https://learn.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute
-// Documentation says to set the DWMWA_USE_IMMERSIVE_DARK_MODE attribute to
-// TRUE to honor dark mode for the window, FALSE to always use light mode. While
-// in fact setting it to TRUE causes dark mode to be always enabled, regardless
-// of the settings. Since it is quite unlikely that it will be fixed, just use
-// UxTheme API to check if dark mode should be applied and while at it enable it
-// fully. Ideally this function should only call the DwmSetWindowAttribute(),
-// but it just doesn't work as documented.
 static void update_dark_mode(const struct vo_w32_state *w32)
 {
+    // NanumPlayer is a dark application: force dark mode for the title bar,
+    // scrollbars and menus instead of following the system setting. Only high
+    // contrast themes are left to the system.
     if (w32->api.pSetPreferredAppMode)
-        w32->api.pSetPreferredAppMode(1); // allow dark mode
+        w32->api.pSetPreferredAppMode(2); // force dark
 
-    // if pShouldAppsUseDarkMode is not available, just assume it to be true
-    const BOOL use_dark_mode = !is_high_contrast() && (!w32->api.pShouldAppsUseDarkMode ||
-                                                       w32->api.pShouldAppsUseDarkMode());
+    const BOOL use_dark_mode = !is_high_contrast();
 
     SetWindowTheme(w32->window, use_dark_mode ? L"DarkMode_Explorer" : L"", NULL);
 
-    DwmSetWindowAttribute(w32->window, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &use_dark_mode, sizeof(use_dark_mode));
+    // Builds before Windows 10 20H1 know this attribute as 19.
+    if (FAILED(DwmSetWindowAttribute(w32->window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                     &use_dark_mode, sizeof(use_dark_mode))))
+        DwmSetWindowAttribute(w32->window, 19, &use_dark_mode, sizeof(use_dark_mode));
+
+    if (w32->parent)
+        return;
+
+    // Windows 11 frame colours (no effect, and no error shown, on Windows 10).
+    COLORREF caption = use_dark_mode ? NANUM_CAPTION_COLOR : NANUM_COLOR_DEFAULT;
+    COLORREF border = use_dark_mode ? NANUM_BORDER_COLOR : NANUM_COLOR_DEFAULT;
+    COLORREF text = use_dark_mode ? NANUM_TEXT_COLOR : NANUM_COLOR_DEFAULT;
+    DwmSetWindowAttribute(w32->window, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
+    DwmSetWindowAttribute(w32->window, DWMWA_BORDER_COLOR, &border, sizeof(border));
+    DwmSetWindowAttribute(w32->window, DWMWA_TEXT_COLOR, &text, sizeof(text));
 }
 
 static void update_backdrop(const struct vo_w32_state *w32)

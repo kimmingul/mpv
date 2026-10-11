@@ -29,6 +29,7 @@
 #include "common/tags.h"
 #include "packet.h"
 #include "stheader.h"
+#include "nanum/nanum.h"
 
 #define MAX_SEEK_RANGES 10
 
@@ -48,6 +49,8 @@ struct demux_reader_state {
     struct demux_ctrl_ts_info ts_info;
     struct demux_ctrl_ts_info ts_per_stream[STREAM_TYPE_COUNT];
     int64_t total_bytes;
+    double nanum_ready;         // AI subtitles ready up to here, or MP_NOPTS_VALUE
+    struct nanum_status nanum;  // full pre-translation state (valid: nanum.valid)
     int64_t fw_bytes;
     int64_t file_cache_bytes;
     double seeking; // current low level seek target, or NOPTS

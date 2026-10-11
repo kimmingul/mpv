@@ -57,6 +57,11 @@
 #include "options/options.h"
 #include "options/path.h"
 #include "input/dnd.h"
+#include "osdep/nanum-startup.h"
+#include "osdep/nanum-open.h"
+#include "osdep/nanum-models.h"
+#include "osdep/nanum-youtube.h"
+#include "osdep/nanum-accel.h"
 #include "input/input.h"
 #include "demux/packet_pool.h"
 
@@ -177,6 +182,12 @@ void mp_print_version(struct mp_log *log, int always)
 
 void mp_destroy(struct MPContext *mpctx)
 {
+    // A running model download is cancelled and joined first, while the
+    // dispatch queue and the option store it publishes through still exist.
+    nanum_models_shutdown(mpctx);
+    nanum_youtube_shutdown(mpctx);
+    nanum_accel_shutdown(mpctx);
+
     mp_shutdown_clients(mpctx);
 
     mp_uninit_ipc(mpctx->ipc_ctx);
@@ -365,6 +376,12 @@ int mp_initialize(struct MPContext *mpctx, char **options)
 
     mp_print_version(mpctx->log, false);
 
+    // NanumPlayer: option defaults sit below mpv.conf and the command line.
+    if (mpctx->is_cli) {
+        nanum_startup_defaults(mpctx);
+        nanum_open_startup(mpctx);
+    }
+
     mp_parse_cfgfiles(mpctx);
 
     if (options) {
@@ -439,6 +456,8 @@ int mp_initialize(struct MPContext *mpctx, char **options)
         }
     }
 
+    if (mpctx->is_cli)
+        nanum_startup_scripts(mpctx);
     mp_load_scripts(mpctx);
 
     if (opts->force_vo == 2 && handle_force_window(mpctx, false) < 0)
@@ -455,13 +474,19 @@ int mp_initialize(struct MPContext *mpctx, char **options)
 
 int mpv_main(int argc, char *argv[])
 {
+    char **options = argv && argv[0] ? argv + 1 : NULL; // skips program name
+
+    // A nanumplayer:// request goes to the running player; this process then ends.
+    int forwarded = nanum_open_forward(options);
+    if (forwarded)
+        return forwarded == 1 ? 0 : 1;
+
     struct MPContext *mpctx = mp_create();
     if (!mpctx)
         return 1;
 
     mpctx->is_cli = true;
 
-    char **options = argv && argv[0] ? argv + 1 : NULL; // skips program name
     int r = mp_initialize(mpctx, options);
     if (r == 0)
         mp_play_files(mpctx);

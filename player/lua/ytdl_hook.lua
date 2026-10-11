@@ -817,6 +817,11 @@ local function add_single_video(json)
         end
     end
 
+    -- NanumPlayer: the title is known before the demuxer opens (AI profile, library).
+    if json.title and mp.get_property("force-media-title", "") == "" then
+        mp.set_property("file-local-options/force-media-title", json.title)
+    end
+
     -- set start time
     if (json.start_time or json.section_start) and
         not option_was_set("start") and
@@ -986,7 +991,8 @@ local function run_ytdl_hook(url)
             end
         end
 
-        ytdl.searched = true
+        -- NanumPlayer: a yt-dlp that is downloaded later is found on the next open.
+        ytdl.searched = ytdl.path ~= ""
 
         mp.set_property("user-data/mpv/ytdl/path", ytdl.path or "")
     end

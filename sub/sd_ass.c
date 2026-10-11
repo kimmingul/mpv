@@ -456,6 +456,17 @@ static void decode(struct sd *sd, struct demux_packet *packet)
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Track *track = ctx->ass_track;
 
+    // NanumPlayer: the read position or AI subtitle presentation changed and
+    // retained events are injected again. Forget the duplicate cache too
+    // (packets of the AI stream all have pos == -1, so they are told apart by
+    // pts only).
+    if (packet->len == sizeof(NANUM_FLUSH_CHUNK) - 1 &&
+        !memcmp(packet->buffer, NANUM_FLUSH_CHUNK, packet->len)) {
+        ass_flush_events(track);
+        ctx->num_seen_packets = 0;
+        return;
+    }
+
     packet->sub_duration = packet->duration;
 
     if (ctx->converter) {

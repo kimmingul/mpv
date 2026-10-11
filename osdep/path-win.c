@@ -67,13 +67,13 @@ static char *mp_get_win_shell_dir(void *talloc_ctx, REFKNOWNFOLDERID folder)
 static char *mp_get_win_app_dir(void *talloc_ctx)
 {
     char *path = mp_get_win_shell_dir(talloc_ctx, &FOLDERID_RoamingAppData);
-    return path ? mp_path_join(talloc_ctx, path, "mpv") : NULL;
+    return path ? mp_path_join(talloc_ctx, path, "NanumPlayer") : NULL;
 }
 
 static char *mp_get_win_local_app_dir(void *talloc_ctx)
 {
     char *path = mp_get_win_shell_dir(talloc_ctx, &FOLDERID_LocalAppData);
-    return path ? mp_path_join(talloc_ctx, path, "mpv") : NULL;
+    return path ? mp_path_join(talloc_ctx, path, "NanumPlayer") : NULL;
 }
 
 static void path_uninit(void)

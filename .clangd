@@ -1,0 +1,4 @@
+# mpv is built with clang/MinGW in MSYS2 CLANG64 (meson); meson writes
+# build/compile_commands.json on every setup.
+CompileFlags:
+  CompilationDatabase: build

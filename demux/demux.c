@@ -303,8 +303,9 @@ struct demux_internal {
     // NanumPlayer AI subtitle bridge. NULL unless --nanum is set and this is
     // the top-level demuxer.
     struct nanum *nanum;
-    struct sh_stream *nanum_sh;     // virtual "ko (AI)" ASS stream
-    struct nanum_cursor nanum_cur;
+    struct sh_stream *nanum_sh[NANUM_INPUTS];   // virtual AI ASS streams
+    struct nanum_cursor nanum_cur[NANUM_INPUTS];
+    unsigned nanum_title_gen;       // last title generation the player was told about
     bool nanum_wakeup;              // AI events arrived: demux thread injects
 
     // -- Access from demuxer thread only
@@ -471,12 +472,19 @@ struct demux_stream {
     // for closed captions (demuxer_feed_caption)
     struct sh_stream *cc;
     bool ignore_eof;        // ignore stream in underrun detection
+
+    // NanumPlayer: selected only because the AI reads it (the pinned audio
+    // track while another track is played). The packets are tapped and dropped,
+    // never queued, and the stream is not read eagerly.
+    bool nanum_only;
 };
 
 static void switch_to_fresh_cache_range(struct demux_internal *in);
 static void demuxer_sort_chapters(demuxer_t *demuxer);
 static MP_THREAD_VOID demux_thread(void *pctx);
 static void update_cache(struct demux_internal *in);
+static bool select_track(struct demux_internal *in, struct sh_stream *stream,
+                         double ref_pts, bool selected);
 static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp);
 static struct demux_packet *advance_reader_head(struct demux_stream *ds);
 static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
@@ -908,7 +916,8 @@ static void update_stream_eager_state(struct demux_internal *in)
         struct demux_stream *s = in->streams[n]->ds;
 
         s->still_image = s->sh->still_image;
-        s->eager = s->selected && !s->sh->absent && !s->sh->attached_picture;
+        s->eager = s->selected && !s->sh->absent && !s->sh->attached_picture &&
+                   !s->nanum_only;
         if (s->eager && !s->still_image)
             any_av_streams |= s->type != STREAM_SUB;
         any_streams |= s->selected;
@@ -991,6 +1000,8 @@ void demux_set_ts_offset(struct demuxer *demuxer, double offset)
     struct demux_internal *in = demuxer->in;
     mp_mutex_lock(&in->lock);
     in->ts_offset = offset;
+    if (in->nanum)
+        nanum_set_ts_offset(in->nanum, offset);
     mp_mutex_unlock(&in->lock);
 }
 
@@ -1089,6 +1100,22 @@ static void demux_add_sh_stream_locked(struct demux_internal *in,
         // Typically this is used for webradio, so any stream will do.
         if (!in->metadata_stream)
             in->metadata_stream = sh;
+    }
+
+    // The AI input tracks (text subtitle, pinned audio) must be demuxed even if
+    // the player does not use them.
+    if (in->nanum) {
+        nanum_register_stream(in->nanum, sh);
+        if (nanum_wants_stream(in->nanum, sh)) {
+            if (nanum_tap_only_stream(sh)) {
+                ds->nanum_only = true;
+                ds->selected = true;
+            } else {
+                ds->selected = true;
+            }
+            update_stream_selection_state(in, ds);
+            in->tracks_switched = true;
+        }
     }
 
     in->events |= DEMUX_EVENT_STREAMS;
@@ -2337,15 +2364,40 @@ static bool lazy_stream_needs_wait(struct demux_stream *ds)
             in->demux_ts <= ds->force_read_until);
 }
 
-// NanumPlayer: queue the AI subtitle events that lie in the already demuxed
-// region. add_packet_locked() silently drops packets of unselected streams
+// NanumPlayer: queue the AI subtitle events of an input that lie in the already
+// demuxed region. add_packet_locked() silently drops packets of unselected streams
 // and while seeking/refreshing, so the cursor must not advance in those cases.
-static void nanum_inject_locked(struct demux_internal *in)
+static void nanum_inject_input(struct demux_internal *in, int input)
 {
-    struct sh_stream *sh = in->nanum_sh;
-    if (!sh || !sh->ds->selected || sh->ds->refreshing || in->seeking ||
-        in->demux_ts == MP_NOPTS_VALUE)
+    struct sh_stream *sh = in->nanum_sh[input];
+    struct nanum_cursor *cur = &in->nanum_cur[input];
+    if (!sh || !sh->ds->selected || in->seeking || in->demux_ts == MP_NOPTS_VALUE)
         return;
+
+    // A refresh seek or a switch to another cached range marks every selected
+    // stream as "refreshing": add_packet_locked() drops what the demuxer reads
+    // again until it is past the last packet queued. This stream's packets do
+    // not come from the demuxer, so nothing would ever end that state (and
+    // refresh_more would keep the demuxer reading past the read-ahead limit).
+    // Resume after the last queued event instead, like a real stream would.
+    if (sh->ds->refreshing) {
+        double last = sh->ds->queue->last_dts;
+        if (last != MP_NOPTS_VALUE && last > cur->last_pts)
+            cur->last_pts = last;
+        sh->ds->refreshing = false;
+    }
+
+    // The presentation (nanum-display) changed, or cues were replaced: whatever is
+    // queued was built for the old state. Drop it; the cursor re-injects the events
+    // from the start of the relevant region, led by a flush marker that makes the ASS
+    // decoder forget what it has shown. (Packets already cached in other seek ranges
+    // keep the presentation they were queued with.)
+    if (nanum_view_pending(in->nanum, cur)) {
+        ds_clear_reader_queue_state(sh->ds);
+        clear_queue(sh->ds->queue);
+        update_seek_ranges(in->current_range);
+        nanum_cursor_flush(in->nanum, cur, MP_NOPTS_VALUE);
+    }
 
     // Speech recognition lags behind the demuxer, so events usually arrive
     // for times the demuxer already passed: the lower bound is where playback
@@ -2353,15 +2405,36 @@ static void nanum_inject_locked(struct demux_internal *in)
     // demuxed everything that is left is due.
     double demux_ts = in->demux_ts;
     double to = in->eof ? INFINITY : demux_ts;
-    double from = in->nanum_cur.from != MP_NOPTS_VALUE ? in->nanum_cur.from
-                                                       : -INFINITY;
+    double from = cur->from != MP_NOPTS_VALUE ? cur->from : -INFINITY;
     // add_packet_locked() overwrites demux_ts with each packet's timestamp;
     // subtitle packets lie behind the read position and must not move it.
     struct demux_packet *dp;
-    while ((dp = nanum_next_packet(in->nanum, in->packet_pool, sh->index,
-                                   &in->nanum_cur, from, to)))
+    while ((dp = nanum_next_packet(in->nanum, in->packet_pool, sh->index, cur, from, to)))
         add_packet_locked(sh, dp);
     in->demux_ts = demux_ts;
+}
+
+static void nanum_inject_locked(struct demux_internal *in)
+{
+    // A virtual stream created after the demuxer opened (the secondary AI input).
+    struct sh_stream *added;
+    int input;
+    while ((added = nanum_pending_stream(in->nanum, &input))) {
+        in->nanum_sh[input] = added;
+        nanum_cursor_init(&in->nanum_cur[input], input);
+        in->nanum_cur[input].from = in->nanum_cur[NANUM_INPUT_PRIMARY].from;
+        demux_add_sh_stream_locked(in, added);
+    }
+    // A virtual stream got another title: the player lists the track again.
+    unsigned titles = nanum_title_gen(in->nanum);
+    if (titles != in->nanum_title_gen) {
+        in->nanum_title_gen = titles;
+        in->events |= DEMUX_EVENT_STREAMS;
+        if (in->wakeup_cb)
+            in->wakeup_cb(in->wakeup_cb_ctx);
+    }
+    for (int i = 0; i < NANUM_INPUTS; i++)
+        nanum_inject_input(in, i);
 }
 
 // Returns true if there was "progress" (lock was released temporarily).
@@ -2491,7 +2564,10 @@ static bool read_packet(struct demux_internal *in)
         mp_assert(pkt->stream >= 0 && pkt->stream < in->num_streams);
         if (in->nanum)
             nanum_tap(in->nanum, in->streams[pkt->stream], pkt);
-        add_packet_locked(in->streams[pkt->stream], pkt);
+        if (in->streams[pkt->stream]->ds->nanum_only)
+            talloc_free(pkt);       // tapped for the AI only, nobody plays it
+        else
+            add_packet_locked(in->streams[pkt->stream], pkt);
         if (in->nanum)
             nanum_inject_locked(in);
     }
@@ -2676,8 +2752,9 @@ static void execute_seek(struct demux_internal *in)
         mp_recorder_mark_discontinuity(in->recorder);
 
     if (in->nanum) {
-        nanum_cursor_reset(&in->nanum_cur, pts);
-        nanum_notify_seek(in->nanum);
+        for (int i = 0; i < NANUM_INPUTS; i++)
+            nanum_cursor_reset(&in->nanum_cur[i], pts);
+        nanum_notify_seek(in->nanum, pts);
     }
 
     mp_mutex_unlock(&in->lock);
@@ -3472,6 +3549,14 @@ void demux_update(demuxer_t *demuxer, double pts)
     }
 
     in->last_playback_pts = pts;
+    if (in->nanum) {
+        // A cue the AI held back for the engine may be due now.
+        if (nanum_set_playhead(in->nanum, pts)) {
+            in->nanum_wakeup = true;
+            mp_cond_signal(&in->wakeup);
+        }
+        nanum_set_duration(in->nanum, in->duration);
+    }
 
     demuxer->events |= in->events;
     in->events = 0;
@@ -3586,16 +3671,104 @@ static void nanum_wakeup_cb(void *p)
     mp_mutex_unlock(&in->lock);
 }
 
+// Makes the demuxer deliver the streams the AI wants (nanum_wants_stream()) even if the
+// player does not use them, and stop delivering the ones that are no longer needed.
+// Called locked; returns whether the selection changed.
+static bool nanum_sync_selection(struct demux_internal *in)
+{
+    bool changed = false;
+    for (int n = 0; n < in->num_streams; n++) {
+        struct sh_stream *sh = in->streams[n];
+        bool wants = nanum_wants_stream(in->nanum, sh);
+        if (!sh->ds->selected && wants) {
+            if (nanum_tap_only_stream(sh)) {
+                // No refresh seek: the live AI starts at the current position.
+                sh->ds->nanum_only = true;
+                sh->ds->selected = true;
+                update_stream_selection_state(in, sh->ds);
+                in->tracks_switched = true;
+                changed = true;
+            } else {
+                changed |= select_track(in, sh, in->last_playback_pts, true);
+            }
+        } else if (sh->ds->nanum_only && !wants) {
+            // The AI moved on or stopped; the player never played this track.
+            sh->ds->nanum_only = false;
+            sh->ds->selected = false;
+            update_stream_selection_state(in, sh->ds);
+            in->tracks_switched = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// Called from the nanum control thread when the AI input tracks may have
+// changed.
+static void nanum_select_cb(void *p)
+{
+    struct demux_internal *in = p;
+    mp_mutex_lock(&in->lock);
+    bool changed = nanum_sync_selection(in);
+    // Playback may already have buffered the new AI input while it was off.
+    // Reuse that audio instead of waiting for reads beyond the cached window.
+    if (in->nanum) {
+        for (int n = 0; n < in->num_streams; n++) {
+            struct sh_stream *sh = in->streams[n];
+            if (sh->type != STREAM_AUDIO || !nanum_wants_stream(in->nanum, sh) ||
+                !nanum_take_audio_replay(in->nanum, sh))
+                continue;
+            for (struct demux_packet *dp = sh->ds->reader_head; dp; dp = dp->next) {
+                struct demux_packet *pkt = dp->is_cached
+                    ? read_packet_from_cache(in, dp) : dp;
+                if (pkt)
+                    nanum_tap(in->nanum, sh, pkt);
+                if (dp->is_cached)
+                    talloc_free(pkt);
+            }
+            if (sh->ds->eof)
+                nanum_notify_eof(in->nanum);
+        }
+    }
+    // Without the demuxer thread the player thread executes the switch itself
+    // (tracks_switched stays set), because this thread must not touch d_thread.
+    if (changed && in->threading)
+        mp_cond_signal(&in->wakeup);
+    mp_mutex_unlock(&in->lock);
+}
+
 static void nanum_attach(struct demux_internal *in)
 {
     struct nanum *n = nanum_create(in, in->global, in->log);
     if (!n)
         return;
     in->nanum = n;
-    nanum_cursor_reset(&in->nanum_cur, MP_NOPTS_VALUE);
+    for (int i = 0; i < NANUM_INPUTS; i++)
+        nanum_cursor_init(&in->nanum_cur[i], i);
     nanum_set_wakeup(n, nanum_wakeup_cb, in);
-    in->nanum_sh = nanum_alloc_stream(n);
-    demux_add_sh_stream(in->d_thread, in->nanum_sh);
+    nanum_set_media(n, in->d_user->filename, in->duration);
+    nanum_set_ts_offset(n, in->ts_offset);
+    // Streams added while the demuxer was opened: record their ids/languages.
+    for (int i = 0; i < in->num_streams; i++)
+        nanum_register_stream(n, in->streams[i]);
+    // Discs have no file to fingerprint: ask the stream for disc/title metadata.
+    char *disc_name = NULL;
+    if (in->d_user->stream) {
+        char *ident = NULL;
+        if (stream_control(in->d_user->stream, STREAM_CTRL_GET_DISC_IDENTITY, &ident) ==
+                STREAM_OK && ident) {
+            nanum_set_disc_identity(n, ident);
+            talloc_free(ident);
+        }
+        if (stream_control(in->d_user->stream, STREAM_CTRL_GET_DISC_NAME, &disc_name) !=
+                STREAM_OK)
+            disc_name = NULL;
+    }
+    // The work is looked up by these names (AI profile).
+    nanum_set_work_titles(n, disc_name, mp_tags_get_str(in->d_user->metadata, "title"));
+    talloc_free(disc_name);
+    in->nanum_sh[NANUM_INPUT_PRIMARY] = nanum_alloc_stream(n, NANUM_INPUT_PRIMARY);
+    demux_add_sh_stream(in->d_thread, in->nanum_sh[NANUM_INPUT_PRIMARY]);
 }
 
 static struct demuxer *open_given_type(struct mpv_global *global,
@@ -3720,10 +3893,15 @@ static struct demuxer *open_given_type(struct mpv_global *global,
             }
         }
 
-        if (params && params->is_top_level)
+        // With a timeline (EDL, ordered chapters) the player uses the timeline demuxer, which
+        // got its own instance above.
+        if (!sub && params && params->is_top_level && params->stream_record)
             nanum_attach(in);
 
         switch_to_fresh_cache_range(in);
+
+        if (in->nanum)
+            nanum_set_select_cb(in->nanum, nanum_select_cb, in);
 
         update_opts(demuxer);
 
@@ -4381,7 +4559,41 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
 {
     struct demux_internal *in = demuxer->in;
     mp_mutex_lock(&in->lock);
-    bool changed = select_track(in, stream, ref_pts, selected);
+    bool changed = false;
+    // The player plays this audio stream: it is the AI's playback input, and the streams
+    // that may become the secondary input start being delivered too.
+    bool ai_audio = in->nanum && selected && stream->type == STREAM_AUDIO;
+    if (ai_audio)
+        nanum_audio_selected(in->nanum, stream);
+    // The AI input tracks stay selected even if the player drops them. A
+    // pinned audio track is then merely tapped, never queued.
+    bool ai_wants = in->nanum && nanum_wants_stream(in->nanum, stream);
+    if (!selected && ai_wants) {
+        if (nanum_tap_only_stream(stream)) {
+            struct demux_stream *ds = stream->ds;
+            if (!ds->nanum_only) {
+                if (ds->selected) {         // clean start: drop what the player queued
+                    ds->selected = false;
+                    update_stream_selection_state(in, ds);
+                }
+                ds->nanum_only = true;
+                ds->selected = true;
+                update_stream_selection_state(in, ds);
+                in->tracks_switched = true;
+                changed = true;
+            }
+            goto done;
+        }
+        selected = true;
+    }
+    if (selected && stream->ds->nanum_only) {
+        // The player starts playing the pinned track: select it for real (the
+        // refresh seek brings in the packets that were dropped so far).
+        stream->ds->nanum_only = false;
+        stream->ds->selected = false;
+        update_stream_selection_state(in, stream->ds);
+    }
+    changed |= select_track(in, stream, ref_pts, selected);
     if (stream->group && !stream->dependent_track) {
         for (int i = 0; i < stream->group->num_members; i++) {
             struct sh_stream *m = stream->group->members[i];
@@ -4390,6 +4602,9 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
                 changed |= select_track(in, m, ref_pts, selected);
         }
     }
+done:
+    if (ai_audio)
+        changed |= nanum_sync_selection(in);
     if (changed) {
         if (in->threading) {
             mp_cond_signal(&in->wakeup);
@@ -4923,6 +5138,9 @@ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *
         }
         r->fw_bytes += get_forward_buffered_bytes(ds);
     }
+    r->nanum_ready = in->nanum ? nanum_ready_until(in->nanum) : MP_NOPTS_VALUE;
+    if (in->nanum)
+        nanum_get_status(in->nanum, &r->nanum);
     struct demux_ctrl_ts_info *ots = &r->ts_info;
     // find stream type with lowest duration and use its state
     for (int n = 0; n < STREAM_TYPE_COUNT; n++) {

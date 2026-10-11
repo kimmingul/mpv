@@ -83,6 +83,11 @@
 #include "osdep/io.h"
 #include "osdep/subprocess.h"
 #include "osdep/terminal.h"
+#include "osdep/nanum-dialogs.h"
+#include "osdep/nanum-models.h"
+#include "osdep/nanum-youtube.h"
+#include "osdep/nanum-accel.h"
+#include "osdep/nanum-diag.h"
 
 #include "core.h"
 
@@ -1628,6 +1633,63 @@ static int mp_property_demuxer_cache_state(void *ctx, struct m_property *prop,
 
     if (s.ts_info.duration >= 0)
         node_map_add_double(r, "cache-duration", s.ts_info.duration);
+
+    if (s.nanum_ready != MP_NOPTS_VALUE)
+        node_map_add_double(r, "nanum-ready-until", s.nanum_ready);
+
+    if (s.nanum.valid) {
+        node_map_add_string(r, "nanum-full-state", s.nanum.full_state);
+        node_map_add_double(r, "nanum-full-progress", s.nanum.full_progress);
+        node_map_add_string(r, "nanum-full-file", s.nanum.full_file);
+        node_map_add_string(r, "nanum-full-error", s.nanum.full_error);
+        node_map_add_string(r, "nanum-input-active", s.nanum.input_active);
+        node_map_add_flag(r, "nanum-text-complete", s.nanum.text_complete);
+        node_map_add_string(r, "nanum-library-state", s.nanum.lib_state);
+        node_map_add_string(r, "nanum-library-source-id", s.nanum.lib_source_id);
+        node_map_add_string(r, "nanum-library-source-language", s.nanum.lib_source_lang);
+        node_map_add_flag(r, "nanum-library-has-source", s.nanum.lib_has_source);
+        node_map_add_flag(r, "nanum-library-has-translation", s.nanum.lib_has_translation);
+        node_map_add_string(r, "nanum-library-summary", s.nanum.lib_summary);
+        node_map_add_string(r, "nanum-library-error", s.nanum.lib_error);
+        node_map_add_string(r, "nanum-ai-state", s.nanum.ai_state);
+        node_map_add_string(r, "nanum-ai-backend", s.nanum.ai_backend);
+        node_map_add_string(r, "nanum-ai-reason", s.nanum.ai_reason);
+        node_map_add_string(r, "nanum-ai-notice", s.nanum.ai_notice);
+        node_map_add_int64(r, "nanum-track-primary", s.nanum.track_primary);
+        node_map_add_int64(r, "nanum-track-secondary", s.nanum.track_secondary);
+        node_map_add_string(r, "nanum-secondary-state", s.nanum.sec_state);
+        node_map_add_string(r, "nanum-secondary-language", s.nanum.sec_lang);
+        if (s.nanum.sec_ready_valid)
+            node_map_add_double(r, "nanum-secondary-ready-until", s.nanum.sec_ready);
+        node_map_add_string(r, "nanum-secondary-reason", s.nanum.sec_reason);
+        node_map_add_string(r, "nanum-original-language", s.nanum.original_lang);
+        node_map_add_string(r, "nanum-profile-state", s.nanum.profile_state);
+        node_map_add_string(r, "nanum-profile-work", s.nanum.profile_work);
+        node_map_add_string(r, "nanum-glossary", s.nanum.glossary);
+        node_map_add_int64(r, "nanum-glossary-count", s.nanum.glossary_count);
+        node_map_add_string(r, "nanum-glossary-apply-state", s.nanum.gl_state);
+        node_map_add_double(r, "nanum-glossary-apply-progress", s.nanum.gl_progress);
+        node_map_add_int64(r, "nanum-glossary-apply-changed", s.nanum.gl_changed);
+        node_map_add_string(r, "nanum-glossary-apply-error", s.nanum.gl_error);
+        node_map_add_int64(r, "nanum-track-pgs", s.nanum.track_pgs);
+        node_map_add_string(r, "nanum-pgs-state", s.nanum.pgs_state);
+        node_map_add_string(r, "nanum-pgs-language", s.nanum.pgs_lang);
+        node_map_add_string(r, "nanum-pgs-reason", s.nanum.pgs_reason);
+        if (s.nanum.pgs_ready_valid)
+            node_map_add_double(r, "nanum-pgs-ready-until", s.nanum.pgs_ready);
+        node_map_add_int64(r, "nanum-track-import", s.nanum.track_import);
+        node_map_add_string(r, "nanum-import-state", s.nanum.imp_state);
+        node_map_add_double(r, "nanum-import-progress", s.nanum.imp_progress);
+        node_map_add_string(r, "nanum-import-error", s.nanum.imp_error);
+        node_map_add_string(r, "nanum-import-note", s.nanum.imp_note);
+        node_map_add_double(r, "nanum-import-offset", s.nanum.imp_offset);
+        node_map_add_double(r, "nanum-import-scale", s.nanum.imp_scale);
+        node_map_add_double(r, "nanum-import-confidence", s.nanum.imp_confidence);
+        node_map_add_flag(r, "nanum-import-low-confidence", s.nanum.imp_low_confidence);
+        node_map_add_string(r, "nanum-import-language", s.nanum.imp_lang);
+        node_map_add_string(r, "nanum-import-origin", s.nanum.imp_origin);
+        node_map_add_int64(r, "nanum-import-lines", s.nanum.imp_lines);
+    }
 
     node_map_add_flag(r, "eof", s.eof);
     node_map_add_flag(r, "underrun", s.underrun);
@@ -7070,6 +7132,86 @@ static void cmd_ao_reload(void *p)
     reload_audio_output(mpctx);
 }
 
+// NanumPlayer: native open dialogs. They return at once; the dialog runs on its
+// own thread and loads the selection with a normal loadfile.
+static void cmd_nanum_open(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    enum nanum_dialog kind = *(const int *)cmd->priv;
+    if (!nanum_dialog_start(cmd->mpctx, kind)) {
+        MP_ERR(cmd->mpctx, "The native open dialog is not available.\n");
+        cmd->success = false;
+    }
+}
+
+// NanumPlayer: optional speech models (osdep/nanum-models-win.c). The commands
+// return at once; the download runs on its own worker and its progress is
+// published as user-data/nanum/models.
+static void cmd_nanum_models_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_models_refresh(cmd->mpctx);
+}
+
+// NanumPlayer: YouTube components (yt-dlp, JavaScript runtime; osdep/nanum-youtube-win.c).
+// Same contract as the model commands; the state is published as user-data/nanum/youtube.
+static void cmd_nanum_youtube_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_youtube_refresh(cmd->mpctx);
+}
+
+static void cmd_nanum_download_youtube_tools(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = nanum_youtube_download(cmd->mpctx);
+}
+
+static void cmd_nanum_cancel_youtube_download(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_youtube_cancel(cmd->mpctx);
+}
+
+static void cmd_nanum_download_models(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = nanum_models_download(cmd->mpctx, cmd->args[0].v.i);
+}
+
+static void cmd_nanum_cancel_model_download(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_models_cancel(cmd->mpctx);
+}
+
+// NanumPlayer: optional CUDA components (osdep/nanum-accel-win.c). Same
+// contract as the model commands: they return at once and the progress is
+// published as user-data/nanum/accelerator.
+static void cmd_nanum_accelerator_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_accel_refresh(cmd->mpctx);
+}
+
+static void cmd_nanum_download_accelerator(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = nanum_accel_download(cmd->mpctx);
+}
+
+static void cmd_nanum_cancel_accelerator_download(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_accel_cancel(cmd->mpctx);
+}
+
+static void cmd_nanum_diagnostics(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = nanum_diag_command(cmd->mpctx, cmd->args[0].v.i);
+}
+
 static void cmd_filter(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7968,6 +8110,30 @@ const struct mp_cmd_def mp_cmds[] = {
         .priv = &(const int){STREAM_VIDEO} },
 
     { "ao-reload", cmd_ao_reload },
+
+    { "nanum-open-file", cmd_nanum_open,
+        .priv = &(const int){NANUM_DIALOG_OPEN_FILE} },
+    { "nanum-open-disc", cmd_nanum_open,
+        .priv = &(const int){NANUM_DIALOG_OPEN_DISC} },
+    { "nanum-models-refresh", cmd_nanum_models_refresh },
+    { "nanum-download-models", cmd_nanum_download_models,
+        { {"target", OPT_CHOICE(v.i,
+            {"all", NANUM_MODELS_ALL},
+            {"english", NANUM_MODELS_ENGLISH},
+            {"multilingual", NANUM_MODELS_MULTILINGUAL},
+            {"multilingual_large", NANUM_MODELS_MULTILINGUAL_LARGE},
+            {"vad", NANUM_MODELS_VAD})} } },
+    { "nanum-cancel-model-download", cmd_nanum_cancel_model_download },
+    { "nanum-youtube-refresh", cmd_nanum_youtube_refresh },
+    { "nanum-download-youtube-tools", cmd_nanum_download_youtube_tools },
+    { "nanum-cancel-youtube-download", cmd_nanum_cancel_youtube_download },
+    { "nanum-accelerator-refresh", cmd_nanum_accelerator_refresh },
+    { "nanum-download-accelerator", cmd_nanum_download_accelerator },
+    { "nanum-cancel-accelerator-download", cmd_nanum_cancel_accelerator_download },
+    { "nanum-diagnostics", cmd_nanum_diagnostics,
+        { {"mode", OPT_CHOICE(v.i, {"toggle", NANUM_DIAG_TOGGLE}, {"on", NANUM_DIAG_ON},
+                              {"off", NANUM_DIAG_OFF}),
+           OPTDEF_INT(NANUM_DIAG_TOGGLE), .flags = MP_CMD_OPT_ARG} } },
 
     { "script-binding", cmd_script_binding,
         {

@@ -29,6 +29,8 @@
 #include <string.h>
 #include <assert.h>
 
+#include <stdatomic.h>
+#include <stdio.h>
 #include <libbluray/bluray.h>
 #include <libbluray/meta_data.h>
 #include <libbluray/overlay.h>
@@ -48,6 +50,9 @@
 #include "osdep/threads.h"
 #include "stream.h"
 #include "osdep/io.h"
+#include "osdep/nanum-diag.h"
+#include "osdep/timer.h"
+#include "stream/bluray_file_win32.h"
 #include "sub/osd.h"
 #include "sub/img_convert.h"
 #include "video/csputils.h"
@@ -101,6 +106,7 @@ static struct mp_log *bluray_log;
 
 static void bluray_logger(const char *msg)
 {
+    nanum_diag_libbluray_message(msg);
     mp_mutex_lock(&bluray_log_lock);
     if (bluray_log)
         mp_msg(bluray_log, MSGL_DEBUG, "%s", msg);
@@ -154,6 +160,13 @@ struct bluray_priv_s {
     uint64_t next_read_pos;          // expected bd_tell() of the next read
     bool read_pos_known;             // next_read_pos is valid
     bool resync_owed;                // jump settled, resync seek not acked yet
+
+    // Disc I/O diagnostics (osdep/nanum-diag.h, stream/bluray_file_win32.h).
+    struct bd_io *io;            // Win32 file layer of this stream
+    uint64_t seek_pending;       // id of the seek still waiting for data, 0: none
+    int64_t seek_start_ns;       // mp_time_ns() at that request
+    double seek_target;
+    uint64_t failure_seen;       // file-layer failure_serial already reported
 
     // Disc-driven audio/sub selection, mirrored from BD_EVENT_AUDIO_STREAM
     // and BD_EVENT_PG_TEXTST{,_STREAM}. The numbers are 1-based libbluray
@@ -457,6 +470,95 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
+// Process-wide seek request counter: the ids stay unique across stream reopens.
+static atomic_uint_fast64_t bluray_seek_serial;
+
+// Where the disc VM is, for seek and read-error records:
+// "playlist=00800 clip=00123(2/5) pos=<bytes> t=<s>s". The clip is the
+// playlist item covering the current time.
+static void describe_position(struct bluray_priv_s *b, char *out, size_t size)
+{
+    uint64_t pos = bd_tell(b->bd);
+    uint64_t tick = bd_tell_time(b->bd);
+    char clip[8] = "?";
+    int index = 0, count = 0;
+    mp_mutex_lock(&b->overlay_lock);
+    int playlist = b->current_playlist;
+    const BLURAY_TITLE_INFO *ti = b->title_info;
+    if (ti) {
+        count = ti->clip_count;
+        for (int i = 0; i < count; i++) {
+            const BLURAY_CLIP_INFO *c = &ti->clips[i];
+            if (tick >= c->start_time && tick < c->start_time + (c->out_time - c->in_time)) {
+                snprintf(clip, sizeof(clip), "%.5s", c->clip_id);
+                index = i + 1;
+                break;
+            }
+        }
+    }
+    mp_mutex_unlock(&b->overlay_lock);
+    snprintf(out, size, "playlist=%05d clip=%s(%d/%d) pos=%"PRIu64" t=%.3fs",
+             playlist, clip, index, count, pos, BD_TIME_TO_S(tick));
+}
+
+// The first data after a seek request: closes the seek's timeline.
+static void seek_first_data(stream_t *s, struct bluray_priv_s *b, int n)
+{
+    if (!b->seek_pending)
+        return;
+    int64_t dt = mp_time_ns() - b->seek_start_ns;
+    if (nanum_diag_enabled()) {
+        char where[200];
+        struct bd_io_info io;
+        describe_position(b, where, sizeof(where));
+        bd_io_info(b->io, &io);
+        nanum_diag_log(true, "seek #%"PRIu64" first data: %d bytes, %.3f ms after the "
+                       "request (target %.3f s): now %s file=%s file_offset=%"PRId64,
+                       b->seek_pending, n, dt / 1e6, b->seek_target, where, io.file,
+                       io.file_pos);
+    }
+    if (dt >= NANUM_DIAG_SLOW_SEEK_MS * INT64_C(1000000)) {
+        MP_WARN(s, "Slow seek: #%"PRIu64" (target %.3f s) needed %.0f ms to deliver data.\n",
+                b->seek_pending, b->seek_target, dt / 1e6);
+    }
+    bd_io_mark_reposition(b->io, 0);
+    b->seek_pending = 0;
+}
+
+// BD_EVENT_READ_ERROR: add what the file layer captured at the failing read
+// (OS error, exact offset, how long it blocked) to libbluray's bare event.
+static void report_read_error(stream_t *s, struct bluray_priv_s *b)
+{
+    struct bd_io_info io;
+    char where[200], cause[420], pending[48] = "";
+    bd_io_info(b->io, &io);
+    describe_position(b, where, sizeof(where));
+    if (io.failure_serial != b->failure_seen) {
+        char text[200] = "", code[260];
+        b->failure_seen = io.failure_serial;
+        if (io.failure_os_error) {
+            nanum_diag_os_error_text(io.failure_os_error, text, sizeof(text));
+            snprintf(code, sizeof(code), "os_error=%lu (%s)",
+                     io.failure_os_error, text);
+        } else {
+            snprintf(code, sizeof(code), "no OS error (ReadFile ended short)");
+        }
+        snprintf(cause, sizeof(cause), "file read failed: %s offset=%"PRId64
+                 " length=%"PRId64" got=%"PRId64", %s, blocked %"PRId64
+                 " ms, returned at %.3f s on the log clock", io.failure_file,
+                 io.failure_offset, io.failure_length, io.failure_got, code,
+                 io.failure_ms, io.failure_time);
+    } else {
+        snprintf(cause, sizeof(cause), "no failed file read was recorded for this "
+                 "unit (not a ReadFile failure at the file layer: decryption or "
+                 "unit validation, or a file source the layer does not cover)");
+    }
+    if (b->seek_pending)
+        snprintf(pending, sizeof(pending), "during seek #%"PRIu64", ", b->seek_pending);
+    MP_WARN(s, "Blu-ray read error context: %s%s; %s\n", pending, where, cause);
+    nanum_diag_log(true, "READ_ERROR event: %s%s; %s", pending, where, cause);
+}
+
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -472,6 +574,8 @@ static void bluray_stream_close(stream_t *s)
         }
         bd_close(priv->bd);
     }
+    bd_io_end(priv->io);
+    priv->io = NULL;
     mp_mutex_lock(&bluray_log_lock);
     // If we created the global log, unset it.
     if (bluray_log == priv->bluray_log)
@@ -543,6 +647,7 @@ static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
             return -1;
         case BD_EVENT_READ_ERROR:
             MP_WARN(s, "Blu-ray read error, skipping unit.\n");
+            report_read_error(s, b);
             break;
         case BD_EVENT_END_OF_TITLE:
             mp_mutex_lock(&b->overlay_lock);
@@ -680,6 +785,7 @@ static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
                 mp_mutex_unlock(&b->overlay_lock);
             }
             b->data_delivered = true;
+            seek_first_data(s, b, n);
             return n;
         }
 
@@ -819,9 +925,43 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     }
     case STREAM_CTRL_SEEK_TO_TIME: {
         double pts = *((double *) arg);
-        bd_seek_time(b->bd, BD_TIME_FROM_S(pts));
+        uint64_t id = atomic_fetch_add(&bluray_seek_serial, 1) + 1;
+        bool diag = nanum_diag_enabled();
+        char where[200];
+        if (b->seek_pending) {
+            nanum_diag_log(true, "seek #%"PRIu64" superseded by #%"PRIu64
+                           " before any data arrived", b->seek_pending, id);
+        }
+        if (diag) {
+            describe_position(b, where, sizeof(where));
+            nanum_diag_log(true, "seek #%"PRIu64" request: target=%.3f s (%"PRIu64
+                           " ticks) from %s", id, pts, BD_TIME_FROM_S(pts), where);
+        }
+        bd_io_mark_reposition(b->io, id);
+        int64_t t0 = mp_time_ns();
+        int64_t res = bd_seek_time(b->bd, BD_TIME_FROM_S(pts));
+        int64_t dt = mp_time_ns() - t0;
+        if (diag) {
+            struct bd_io_info io;
+            bd_io_info(b->io, &io);
+            describe_position(b, where, sizeof(where));
+            nanum_diag_log(true, "seek #%"PRIu64" bd_seek_time returned %"PRId64
+                           " in %.3f ms: now %s file=%s file_offset=%"PRId64,
+                           id, res, dt / 1e6, where, io.file, io.file_pos);
+        }
+        if (res < 0) {
+            MP_WARN(s, "Seek #%"PRIu64" to %.3f s refused by the disc "
+                    "(bd_seek_time returned %"PRId64", user operation mask).\n",
+                    id, pts, res);
+        } else if (dt >= NANUM_DIAG_SLOW_SEEK_MS * INT64_C(1000000)) {
+            MP_WARN(s, "Slow seek: #%"PRIu64" to %.3f s, bd_seek_time took %.0f ms.\n",
+                    id, pts, dt / 1e6);
+        }
         stream_drop_buffers(s);
         b->read_pos_known = false;
+        b->seek_pending = id;
+        b->seek_start_ns = t0;
+        b->seek_target = pts;
         // API makes it hard to determine seeking success
         return STREAM_OK;
     }
@@ -915,6 +1055,68 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         if (!meta || !meta->di_name || !meta->di_name[0])
             break;
         *(char**)arg = talloc_strdup(NULL, meta->di_name);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_DISC_IDENTITY: {
+        // Disc-specific metadata for the NanumPlayer library: libbluray's disc id
+        // (hash of the disc's own files), the UDF volume id, the selected title
+        // and playlist with its clips and the track languages. A disc whose id
+        // and volume are both empty, or a title that is not known (menu), has no
+        // identity.
+        const BLURAY_DISC_INFO *info = b->bd ? bd_get_disc_info(b->bd) : NULL;
+        if (!info)
+            return STREAM_UNSUPPORTED;
+        char id[41];
+        bool any = false;
+        for (int i = 0; i < 20; i++) {
+            snprintf(id + i * 2, 3, "%02x", info->disc_id[i]);
+            any |= info->disc_id[i] != 0;
+        }
+        const char *vol = info->udf_volume_id ? info->udf_volume_id : "";
+        if (!any && !vol[0])
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&b->overlay_lock);
+        int angle = b->current_angle, title = b->current_title;
+        BLURAY_TITLE_INFO *own = NULL;
+        const BLURAY_TITLE_INFO *ti = b->title_info;
+        if (!ti && title >= 0 && title < b->num_titles) {
+            mp_mutex_unlock(&b->overlay_lock);
+            own = bd_get_title_info(b->bd, title, angle > 0 ? angle : 0);
+            ti = own;
+            mp_mutex_lock(&b->overlay_lock);
+        }
+        char *ident = NULL;
+        if (ti) {
+            ident = talloc_asprintf(NULL,
+                                    "bd1|disc=%s|vol=%s|title=%d|pl=%u|dur=%llu|angle=%d|clips=",
+                                    id, vol, title, (unsigned)ti->playlist,
+                                    (unsigned long long)ti->duration, angle);
+            for (uint32_t c = 0; c < ti->clip_count; c++) {
+                const BLURAY_CLIP_INFO *ci = &ti->clips[c];
+                ident = talloc_asprintf_append(ident, "%.5s:%llu-%llu,", ci->clip_id,
+                                               (unsigned long long)ci->in_time,
+                                               (unsigned long long)ci->out_time);
+            }
+            if (ti->clip_count) {
+                const BLURAY_CLIP_INFO *ci = &ti->clips[0];
+                ident = talloc_asprintf_append(ident, "|a=");
+                for (int n = 0; n < ci->audio_stream_count; n++)
+                    ident = talloc_asprintf_append(ident, "%u:%.4s,",
+                                                   (unsigned)ci->audio_streams[n].pid,
+                                                   (const char *)ci->audio_streams[n].lang);
+                ident = talloc_asprintf_append(ident, "|s=");
+                for (int n = 0; n < ci->pg_stream_count; n++)
+                    ident = talloc_asprintf_append(ident, "%u:%.4s,",
+                                                   (unsigned)ci->pg_streams[n].pid,
+                                                   (const char *)ci->pg_streams[n].lang);
+            }
+        }
+        mp_mutex_unlock(&b->overlay_lock);
+        if (own)
+            bd_free_title_info(own);
+        if (!ident)
+            return STREAM_UNSUPPORTED;
+        *(char **)arg = ident;
         return STREAM_OK;
     }
     case STREAM_CTRL_NAV_CMD: {
@@ -1203,6 +1405,10 @@ static int bluray_stream_open_internal(stream_t *s)
     uint32_t mask = 0;
     if (mp_msg_test(s->log, MSGL_DEBUG))
         mask |= DBG_CRIT | DBG_BLURAY | DBG_HDMV;
+    // Diagnostics need libbluray's error/state messages (and libmmbd's
+    // announcement of its debug log) even without a debug-level log.
+    if (nanum_diag_enabled())
+        mask |= DBG_CRIT | DBG_BLURAY;
     // When all bits are set (-1) libbluray inits to DBG_CRIT, set all bits,
     // except one, so we avoid this default fallback.
     if (mp_msg_test(s->log, MSGL_TRACE))
@@ -1214,8 +1420,19 @@ static int bluray_stream_open_internal(stream_t *s)
     mp_mutex_unlock(&bluray_log_lock);
 
     /* open device */
+    // Win32 file access that keeps the OS error of a failing read (libbluray's
+    // default reports a short count only). A no-op elsewhere, see
+    // bluray_file_win32.h; the device path, and with it AACS/BD+, is unchanged.
+    b->io = bd_io_begin(s->log);
     char *device_tmp = mp_get_user_path(NULL, s->global, device);
     BLURAY *bd = bd_open(device_tmp, NULL);
+    if (bd || !b->probing) {
+        int major = 0, minor = 0, micro = 0;
+        bd_get_version(&major, &minor, &micro);
+        char version[32];
+        snprintf(version, sizeof(version), "%d.%d.%d", major, minor, micro);
+        nanum_diag_describe_bluray(s->log, device_tmp, version);
+    }
     talloc_free(device_tmp);
     if (!bd) {
         if (!b->probing)

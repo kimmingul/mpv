@@ -112,6 +112,14 @@ void mp_init_paths(struct mpv_global *global, struct MPOpts *opts)
     const char *force_configdir = getenv("MPV_HOME");
     if (opts->force_configdir && opts->force_configdir[0])
         force_configdir = opts->force_configdir;
+#ifdef _WIN32
+    // NanumPlayer: settings live only in the user's NanumPlayer config dir
+    // (%APPDATA%\NanumPlayer, or portable_config next to the executable). The
+    // installation folder is not a config dir: its scripts\ holds NanumPlayer's
+    // own scripts, which are loaded explicitly (osdep/nanum-startup-win.c).
+    if (!force_configdir || !force_configdir[0])
+        force_configdir = "~~home/";
+#endif
     if (!opts->load_config)
         force_configdir = "";
 

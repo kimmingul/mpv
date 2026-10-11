@@ -94,6 +94,7 @@ sources = files(
     ## Demuxers
     ## NanumPlayer
     'nanum/nanum.c',
+    'nanum/library.c',
 
     'demux/codec_tags.c',
     'demux/cue.c',
@@ -377,6 +378,11 @@ if features['subrandr']
     dependencies += subrandr
 endif
 
+# NanumPlayer media library (nanum/library.c): system SQLite, linked dynamically so
+# tools/package.py's DLL closure of mpv.exe ships it automatically.
+sqlite3 = dependency('sqlite3', required: true)
+dependencies += sqlite3
+
 # C11 atomics are mandatory but linking to the library is not always required.
 dependencies += cc.find_library('atomic', required: false)
 
@@ -522,6 +528,7 @@ endif
 features += {'win32-desktop': win32 and not uwp.found()}
 if features['win32-desktop']
     win32_desktop_libs = [cc.find_library('avrt'),
+                          cc.find_library('bcrypt'),
                           cc.find_library('dwmapi'),
                           cc.find_library('gdi32'),
                           cc.find_library('imm32'),
@@ -532,7 +539,8 @@ if features['win32-desktop']
                           cc.find_library('user32'),
                           cc.find_library('uuid'),
                           cc.find_library('uxtheme'),
-                          cc.find_library('version')]
+                          cc.find_library('version'),
+                          cc.find_library('winhttp')]
     dependencies += win32_desktop_libs
     path_source = files('osdep/path-win.c')
     if not get_option('fuzzers')
@@ -544,6 +552,14 @@ if features['win32-desktop']
                      'player/clipboard/clipboard-win.c',
                      'osdep/language-win.c',
                      'osdep/terminal-win.c',
+                     'osdep/nanum-dialogs-win.c',
+                     'osdep/nanum-diag-win.c',
+                     'osdep/nanum-accel-win.c',
+                     'osdep/nanum-download-win.c',
+                     'osdep/nanum-models-win.c',
+                     'osdep/nanum-open-win.c',
+                     'osdep/nanum-youtube-win.c',
+                     'osdep/nanum-startup-win.c',
                      'osdep/w32_register.c',
                      'video/out/w32_common.c',
                      'video/out/win32/displayconfig.c',
@@ -726,6 +742,10 @@ features += {'libbluray': libbluray.found()}
 if features['libbluray']
     dependencies += libbluray
     sources += files('stream/stream_bluray.c')
+    if features['win32-desktop']
+        # libbluray file access with Win32 error capture (stream/bluray_file_win32.h)
+        sources += files('stream/bluray_file_win32.c')
+    endif
 endif
 
 libm = cc.find_library('m', required: false)
@@ -1820,8 +1840,8 @@ if win32
     # Hence, these includes are needed.
     res_includes = [source_root, build_root]
 
-    resources = ['etc/mpv-icon.ico',
-                 'osdep/mpv.exe.manifest']
+    resources = ['etc/nanum-icon.ico',
+                 'osdep/NanumPlayer.exe.manifest']
 
     sources += windows.compile_resources('osdep/mpv.rc', args: res_flags, depend_files: resources,
                                          depends: version_h, include_directories: res_includes)
@@ -1887,20 +1907,11 @@ if get_option('cplayer')
     install_data('etc/mpv-symbolic.svg', install_tag: 'xdg',
                  install_dir: join_paths(hicolor_dir, 'symbolic', 'apps'))
 
-    mpv = executable('mpv', main_fn_source, objects: libmpv.extract_all_objects(recursive: true), dependencies: dependencies,
+    # NanumPlayer: the player is NanumPlayer.exe itself, started directly (no
+    # launcher, no mpv.com console wrapper). Everything else sits next to it.
+    exe_name = win32 ? 'NanumPlayer' : 'mpv'
+    mpv = executable(exe_name, main_fn_source, objects: libmpv.extract_all_objects(recursive: true), dependencies: dependencies,
                      win_subsystem: get_option('win32-subsystem'), install: true)
-
-    if win32
-        if get_option('win32-subsystem') != 'console'
-            wrapper_sources = 'osdep/win32-console-wrapper.c'
-            executable('mpv', wrapper_sources, c_args: ['-municode', '-fno-asynchronous-unwind-tables', '-fno-stack-protector', '-Os'],
-                       link_args: ['-municode', '-nostartfiles', '-nodefaultlibs'],
-                       override_options: ['b_sanitize=none'],
-                       name_suffix: 'com', install: true)
-        endif
-        install_data(['etc/mpv-register.bat', 'etc/mpv-unregister.bat'],
-                     install_dir: get_option('bindir'))
-    endif
 
     if darwin
         osxbundle = find_program(join_paths(tools_directory, 'osxbundle.py'), required: true)

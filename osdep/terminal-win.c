@@ -589,10 +589,9 @@ static void reopen_console_handle(DWORD std, int fd, FILE *stream)
 
 bool terminal_try_attach(void)
 {
-    // mpv.exe is a flagged as a GUI application, but it acts as a console
-    // application when started from the console wrapper (see
-    // osdep/win32-console-wrapper.c). The console wrapper sets
-    // _started_from_console=yes, so check that variable before trying to
+    // NanumPlayer.exe is flagged as a GUI application. Callers that want
+    // console output set _started_from_console=yes (NanumPlayer no longer
+    // ships a console wrapper), so check that variable before trying to
     // attach to the console.
     wchar_t console_env[4] = { 0 };
     if (!GetEnvironmentVariableW(L"_started_from_console", console_env, 4))

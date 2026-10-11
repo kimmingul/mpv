@@ -5,6 +5,7 @@
 #include "osdep/io.h"
 #include "osdep/terminal.h"
 #include "osdep/main-fn.h"
+#include "osdep/nanum-startup.h"
 
 #ifndef HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION
 
@@ -57,13 +58,20 @@ int main(void)
 {
     microsoft_nonsense();
 
-    // If started from the console wrapper (see osdep/win32-console-wrapper.c),
-    // attach to the console and set up the standard IO handles
+    // NanumPlayer.exe is the player itself (no launcher process): connect the
+    // Blu-ray decryption libraries before libbluray can look for them.
+    nanum_startup_environment();
+
+    // If the caller asked for console output by setting _started_from_console=yes
+    // (NanumPlayer has no console wrapper), attach to its console and set up the
+    // standard IO handles
     bool has_console = terminal_try_attach();
 
-    // If mpv is started from Explorer, the Run dialog or the Start Menu, it
-    // will have no console and no standard IO handles. In this case, the user
-    // is expecting mpv to show some UI, so enable the pseudo-GUI profile.
+    // If NanumPlayer is started from Explorer, the Run dialog or the Start Menu,
+    // it has no console and no standard IO handles. In this case enable the
+    // pseudo-GUI profile (terminal=no). The NanumPlayer option defaults
+    // (osc=no, idle, force-window, engine paths) are applied separately by
+    // nanum_startup_defaults(), below config files and the command line.
     bool gui = !has_console && !has_redirected_stdio();
 
     int argc = 0;

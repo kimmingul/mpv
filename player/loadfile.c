@@ -28,6 +28,7 @@
 #include "misc/thread_pool.h"
 #include "misc/thread_tools.h"
 #include "osdep/io.h"
+#include "osdep/nanum-open.h"
 #include "osdep/terminal.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -498,8 +499,17 @@ static struct track *add_stream_track(struct MPContext *mpctx,
 {
     for (int i = 0; i < mpctx->num_tracks; i++) {
         struct track *track = mpctx->tracks[i];
-        if (track->stream == stream)
+        if (track->stream == stream) {
+            // The AI bridge (demux/nanum) gives its virtual subtitle tracks another
+            // title once it knows the language of their source. Old title strings
+            // stay valid until the demuxer is destroyed.
+            char *title = __atomic_load_n(&stream->title, __ATOMIC_ACQUIRE);
+            if (title && track->title != title) {
+                track->title = title;
+                mp_notify(mpctx, MP_EVENT_TRACKS_CHANGED, NULL);
+            }
             return track;
+        }
     }
 
     struct track *track = talloc_ptrtype(NULL, track);
@@ -1865,6 +1875,7 @@ static void play_current_file(struct MPContext *mpctx)
 
     load_per_file_options(mpctx->mconfig, mpctx->playing->params,
                           mpctx->playing->num_params);
+    nanum_open_prepare_file(mpctx, mpctx->filename);
 
     mpctx->remaining_file_loops = mpctx->opts->loop_file;
     mp_notify_property(mpctx, "remaining-file-loops");
