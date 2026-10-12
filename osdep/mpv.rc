@@ -17,14 +17,15 @@
 
 #include <winver.h>
 #include "version.h"
+#include "osdep/nanum-version.h"
 
 // NanumPlayer.exe is mpv, modified: AI subtitles, native Windows UI. mpv's
 // licence (GPL v2 or later) and copyright notice are kept in the resources.
-#define NANUM_VERSION "1.6.2"
+// NANUM_VERSION* come from osdep/nanum-version.h.
 
 VS_VERSION_INFO VERSIONINFO
-    FILEVERSION 1, 6, 2, 0
-    PRODUCTVERSION 1, 6, 2, 0
+    FILEVERSION NANUM_VERSION_MAJOR, NANUM_VERSION_MINOR, NANUM_VERSION_PATCH, 0
+    PRODUCTVERSION NANUM_VERSION_MAJOR, NANUM_VERSION_MINOR, NANUM_VERSION_PATCH, 0
     FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
     FILEFLAGS 0
     FILEOS VOS__WINDOWS32

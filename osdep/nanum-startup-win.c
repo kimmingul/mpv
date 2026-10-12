@@ -12,20 +12,25 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "mpv/client.h"
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "common/msg.h"
+#include "misc/node.h"
 #include "misc/path_utils.h"
 #include "options/m_config.h"
+#include "options/m_property.h"
 #include "options/options.h"
 #include "options/parse_configfile.h"
 #include "options/path.h"
 #include "osdep/io.h"
 #include "osdep/nanum-startup.h"
+#include "osdep/nanum-version.h"
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
 #include "osdep/nanum-diag.h"
+#include "player/command.h"
 #include "player/core.h"
 
 // Written to the config dir on first run only. Never touched afterwards.
@@ -224,7 +229,7 @@ void nanum_startup_defaults(struct MPContext *mpctx)
 {
     void *tmp = talloc_new(NULL);
 
-    MP_INFO(mpctx, "NanumPlayer 1.6.2 (%s)\n", mpv_version);
+    MP_INFO(mpctx, "NanumPlayer " NANUM_VERSION " (%s)\n", mpv_version);
 
     bool configured = false;
     char *settings = settings_dir(tmp, mpctx->global, &configured);
@@ -315,7 +320,10 @@ static bool script_given(struct MPContext *mpctx, const char *name)
 void nanum_startup_scripts(struct MPContext *mpctx)
 {
     void *tmp = talloc_new(NULL);
-    // Scripts find user-data/nanum/models already filled when they load.
+    // Scripts find user-data/nanum/app-version and user-data/nanum/models already filled
+    // when they load.
+    mpv_node version = {.format = MPV_FORMAT_STRING, .u.string = (char *)NANUM_VERSION};
+    mp_property_do("user-data/nanum/app-version", M_PROPERTY_SET_NODE, &version, mpctx);
     nanum_models_refresh(mpctx);
     nanum_accel_refresh(mpctx);
     nanum_youtube_publish(mpctx);
