@@ -94,6 +94,7 @@ sources = files(
     ## Demuxers
     ## NanumPlayer
     'nanum/nanum.c',
+    'nanum/i18n.c',
     'nanum/library.c',
 
     'demux/codec_tags.c',
@@ -560,6 +561,7 @@ if features['win32-desktop']
                      'osdep/nanum-open-win.c',
                      'osdep/nanum-youtube-win.c',
                      'osdep/nanum-startup-win.c',
+                     'osdep/nanum-private-win.c',
                      'osdep/w32_register.c',
                      'video/out/w32_common.c',
                      'video/out/win32/displayconfig.c',
@@ -638,6 +640,29 @@ ebml_types = custom_target('ebml_types.h',
 )
 
 sources += [ebml_defs, ebml_types]
+
+# NanumPlayer native interface texts: locales/native.json (UTF-8 keyed catalog shared with the
+# scripts) is compiled to two allocation-free lookup headers (UTF-8 and wchar_t) that only
+# nanum/i18n.c includes. They are regenerated whenever the catalog or the generator changes.
+nanum_i18n_catalog = files('../../locales/native.json')
+nanum_i18n_tool = files('../../tools/compile_translations.py')
+nanum_i18n_headers = [
+    custom_target('nanum_native_strings.h',
+        input: nanum_i18n_catalog,
+        output: 'nanum_native_strings.h',
+        command: [python, nanum_i18n_tool, '--input', '@INPUT@', '--output', '@OUTPUT@',
+                  '--prefix', 'nanum_native'],
+        depend_files: nanum_i18n_tool,
+    ),
+    custom_target('nanum_native_strings_w.h',
+        input: nanum_i18n_catalog,
+        output: 'nanum_native_strings_w.h',
+        command: [python, nanum_i18n_tool, '--input', '@INPUT@', '--output', '@OUTPUT@',
+                  '--prefix', 'nanum_native_w', '--wide'],
+        depend_files: nanum_i18n_tool,
+    ),
+]
+sources += nanum_i18n_headers
 
 subdir('common')
 subdir('etc')
@@ -745,6 +770,8 @@ if features['libbluray']
     if features['win32-desktop']
         # libbluray file access with Win32 error capture (stream/bluray_file_win32.h)
         sources += files('stream/bluray_file_win32.c')
+        dependencies += dependency('zlib')
+        sources += files('osdep/nanum-disc.c', 'osdep/nanum-disc-keys.c')
     endif
 endif
 

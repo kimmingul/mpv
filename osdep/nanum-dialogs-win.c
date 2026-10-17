@@ -20,6 +20,7 @@
 #include "player/command.h"
 #include "osdep/io.h"
 #include "osdep/nanum-dialogs.h"
+#include "nanum/i18n.h"
 #include "osdep/threads.h"
 #include "player/client.h"
 #include "player/core.h"
@@ -158,22 +159,22 @@ static char **pick_files(void *ctx, HWND owner, int *num)
     if (!create_dialog(&dlg))
         return NULL;
 
-    static const COMDLG_FILTERSPEC types[] = {
-        {L"동영상 · 오디오 파일",
+    const COMDLG_FILTERSPEC types[] = {
+        {nanum_trw(L"동영상 · 오디오 파일"),
          L"*.mkv;*.mp4;*.m4v;*.mov;*.avi;*.wmv;*.flv;*.webm;*.ts;*.m2ts;*.mts;"
          L"*.mpg;*.mpeg;*.vob;*.ogv;*.3gp;*.mp3;*.flac;*.wav;*.ogg;*.opus;"
          L"*.m4a;*.aac;*.wma;*.ac3;*.dts;*.mka"},
-        {L"재생 목록", L"*.m3u;*.m3u8;*.pls"},
-        {L"모든 파일", L"*.*"},
+        {nanum_trw(L"재생 목록"), L"*.m3u;*.m3u8;*.pls"},
+        {nanum_trw(L"모든 파일"), L"*.*"},
     };
 
     DWORD flags = 0;
     IFileOpenDialog_GetOptions(dlg, &flags);
     IFileOpenDialog_SetOptions(dlg, flags | FOS_FORCEFILESYSTEM |
                                FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST |
-                               FOS_PATHMUSTEXIST);
-    IFileOpenDialog_SetTitle(dlg, L"파일 열기");
-    IFileOpenDialog_SetOkButtonLabel(dlg, L"열기");
+                               FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT);
+    IFileOpenDialog_SetTitle(dlg, nanum_trw(L"파일 열기"));
+    IFileOpenDialog_SetOkButtonLabel(dlg, nanum_trw(L"열기"));
     IFileOpenDialog_SetFileTypes(dlg, MP_ARRAY_SIZE(types), types);
     IFileOpenDialog_SetFileTypeIndex(dlg, 1);
     IFileOpenDialog_SetClientGuid(dlg, &nd_guid_files);
@@ -211,9 +212,9 @@ static wchar_t *pick_folder(void *ctx, HWND owner, const wchar_t *start)
     DWORD flags = 0;
     IFileOpenDialog_GetOptions(dlg, &flags);
     IFileOpenDialog_SetOptions(dlg, flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
-                               FOS_PATHMUSTEXIST);
-    IFileOpenDialog_SetTitle(dlg, L"Blu-ray 드라이브 또는 폴더 선택");
-    IFileOpenDialog_SetOkButtonLabel(dlg, L"재생");
+                               FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT);
+    IFileOpenDialog_SetTitle(dlg, nanum_trw(L"Blu-ray 드라이브 또는 폴더 선택"));
+    IFileOpenDialog_SetOkButtonLabel(dlg, nanum_trw(L"재생"));
     IFileOpenDialog_SetClientGuid(dlg, &nd_guid_disc);
     if (start)
         set_start_folder(dlg, start);
@@ -292,11 +293,14 @@ static int choose_drive(HWND owner, const struct drive *drives, int num)
     wchar_t text[MAX_DRIVES][128];
     TASKDIALOG_BUTTON buttons[MAX_DRIVES + 1];
     for (int i = 0; i < num; i++) {
-        swprintf(text[i], MP_ARRAY_SIZE(text[i]), L"%.2ls  %ls\nBlu-ray 디스크 (BDMV)",
-                 drives[i].root, drives[i].label[0] ? drives[i].label : L"(이름 없음)");
+        swprintf(text[i], MP_ARRAY_SIZE(text[i]), L"%.2ls  %ls\n%ls",
+                 drives[i].root,
+                 drives[i].label[0] ? drives[i].label : nanum_trw(L"(이름 없음)"),
+                 nanum_trw(L"Blu-ray 디스크 (BDMV)"));
         buttons[i] = (TASKDIALOG_BUTTON){ID_DRIVE_BASE + i, text[i]};
     }
-    buttons[num] = (TASKDIALOG_BUTTON){ID_BROWSE, L"다른 폴더 선택…\nBDMV 폴더가 있는 위치를 직접 선택합니다"};
+    buttons[num] = (TASKDIALOG_BUTTON){ID_BROWSE,
+        nanum_trw(L"다른 폴더 선택…\nBDMV 폴더가 있는 위치를 직접 선택합니다")};
 
     TASKDIALOGCONFIG cfg = {
         .cbSize = sizeof(cfg),
@@ -305,8 +309,8 @@ static int choose_drive(HWND owner, const struct drive *drives, int num)
                    TDF_POSITION_RELATIVE_TO_WINDOW,
         .dwCommonButtons = TDCBF_CANCEL_BUTTON,
         .pszWindowTitle = L"NanumPlayer",
-        .pszMainInstruction = L"재생할 Blu-ray를 선택하세요",
-        .pszContent = L"BDMV 폴더가 있는 드라이브가 여러 개 있습니다.",
+        .pszMainInstruction = nanum_trw(L"재생할 Blu-ray를 선택하세요"),
+        .pszContent = nanum_trw(L"BDMV 폴더가 있는 드라이브가 여러 개 있습니다."),
         .cButtons = num + 1,
         .pButtons = buttons,
     };
@@ -393,8 +397,8 @@ static void open_disc(struct request *req, void *ctx)
         return;
     char *device = disc_device_from_folder(ctx, folder);
     if (!device) {
-        message(req->owner, L"선택한 위치에서 Blu-ray(BDMV) 폴더를 찾을 수 없습니다.\n"
-                            L"디스크가 들어 있는 드라이브나 BDMV 폴더가 있는 폴더를 선택하세요.");
+        message(req->owner, nanum_trw(L"선택한 위치에서 Blu-ray(BDMV) 폴더를 찾을 수 없습니다.\n"
+                                      L"디스크가 들어 있는 드라이브나 BDMV 폴더가 있는 폴더를 선택하세요."));
         return;
     }
     load_selection(req->mpctx, NULL, 0, device);

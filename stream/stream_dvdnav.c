@@ -72,6 +72,9 @@ struct priv {
     int64_t duration;                   // in 90 kHz PTS ticks
     int title;
     bool had_initial_vts;
+    bool stop_at_title_end;             // EOF where the selected title ends
+    bool title_ended;                   // EOF latched, no further block is read
+    int32_t end_title;                  // the title (1-based) the end is relative to
 
     int dvd_speed;
 
@@ -591,6 +594,18 @@ static int mp_dvdnav_number_of_subs(stream_t *stream)
     return n;
 }
 
+// True while the VM plays the title that STOP_AT_TITLE_END armed (title domain
+// only: a menu, another title or another title set ends it). The PGC may change
+// within the title.
+static bool in_end_title(struct priv *priv)
+{
+    dvdnav_t *dvdnav = priv->dvdnav;
+    int32_t tit = 0, part = 0;
+    return dvdnav_is_domain_vts(dvdnav) == 1 &&
+           dvdnav_current_title_info(dvdnav, &tit, &part) == DVDNAV_STATUS_OK &&
+           tit == priv->end_title;
+}
+
 // Handle one event from dvdnav_get_next_block(). Returns the value that
 // fill_buffer() should return, or -1 to continue reading..
 static int process_event(stream_t *s, int event, void *buf, int len)
@@ -678,6 +693,11 @@ static int process_event(stream_t *s, int event, void *buf, int len)
             priv->had_initial_vts = true;
             break;
         }
+        if (priv->stop_at_title_end) {
+            MP_VERBOSE(s, "title set changed, end of the title\n");
+            priv->title_ended = true;
+            return 0;
+        }
         if (dvdnav_current_title_info(dvdnav, &tit, &part) == DVDNAV_STATUS_OK)
         {
             MP_VERBOSE(s, "new title %d\n", tit);
@@ -702,6 +722,13 @@ static int process_event(stream_t *s, int event, void *buf, int len)
                    ev->cellN, ev->pgN, DVD_TIME_TO_S(ev->pgc_length),
                    DVD_TIME_TO_S(dvdnav_get_current_time(dvdnav)),
                    dvd_domain_name(dvdnav));
+        // The event precedes the first block of the new cell: everything the
+        // stream delivered so far belongs to the title.
+        if (priv->stop_at_title_end && !in_end_title(priv)) {
+            MP_VERBOSE(s, "left title %d, end of the title\n", priv->end_title);
+            priv->title_ended = true;
+            return 0;
+        }
         break;
     }
     case DVDNAV_SPU_CLUT_CHANGE: {
@@ -754,7 +781,10 @@ static int fill_buffer(stream_t *s, void *buf, int max_len)
     while (1) {
         mp_mutex_lock(&priv->lock);
         bool drain = priv->pending_drain;
+        bool ended = priv->title_ended;
         mp_mutex_unlock(&priv->lock);
+        if (ended)
+            return 0;
         if (drain) {
             MP_DBG(s, "holding drain EOF (jump boundary)\n");
             return 0;
@@ -1022,6 +1052,21 @@ static int control(stream_t *stream, int cmd, void *arg)
         priv->at_boundary = false;
         mp_mutex_unlock(&priv->lock);
         MP_DBG(stream, "jump boundary drain enabled\n");
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_NAV_STOP_AT_TITLE_END: {
+        // arg: int* title number (1-based). Fails unless the VM currently plays it.
+        int want = *(int *)arg;
+        if (want <= 0 || dvdnav_is_domain_vts(dvdnav) != 1 ||
+            dvdnav_current_title_info(dvdnav, &tit, &part) != DVDNAV_STATUS_OK ||
+            tit != want)
+            return STREAM_ERROR;
+        mp_mutex_lock(&priv->lock);
+        priv->end_title = want;
+        priv->stop_at_title_end = true;
+        priv->title_ended = false;
+        mp_mutex_unlock(&priv->lock);
+        MP_VERBOSE(stream, "stopping at the end of title %d\n", want);
         return STREAM_OK;
     }
     case STREAM_CTRL_NAV_DRAIN_ACK: {

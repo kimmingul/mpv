@@ -315,6 +315,28 @@ bstr mp_split_proto(bstr path, bstr *out_url)
     return r;
 }
 
+// NanumPlayer: whether path is a network location (web pages, streams, ytdl://)
+// rather than a local file, disc or generated source. What is played from the
+// network is never remembered anywhere (resume position, watch history, subtitle
+// library, translation cache).
+bool mp_is_network_entry(const char *path)
+{
+    static const char *const protos[] = {
+        "http", "https", "ytdl", "ftp", "ftps", "sftp", "rtmp", "rtmps", "rtmpe",
+        "rtmpt", "rtmpte", "rtmpts", "rtsp", "rtsps", "mms", "mmsh", "mmst", "srt",
+        "rist", "udp", "tcp", "tls", "rtp", "smb", "hls", "dav", "davs", "ffmpeg",
+        "lavf",
+    };
+    if (!path)
+        return false;
+    bstr proto = mp_split_proto(bstr0(path), NULL);
+    for (int n = 0; proto.len && n < MP_ARRAY_SIZE(protos); n++) {
+        if (!bstrcasecmp0(proto, protos[n]))
+            return true;
+    }
+    return false;
+}
+
 void mp_mkdirp(const char *dir)
 {
     if (mp_path_exists(dir))

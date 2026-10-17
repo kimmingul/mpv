@@ -63,8 +63,8 @@ struct lib_found {
     char tr_model[128], tr_engine[16], tr_target[64];
 };
 
-// path NULL/"": %LOCALAPPDATA%/NanumPlayer/library.sqlite. NULL on failure
-// (err filled).
+// path: the library file (--nanum-library-db); the library is opt-in and has no
+// default location. NULL on failure (err filled).
 struct nanum_lib *lib_open(const char *path, char *err, size_t errsz);
 void lib_close(struct nanum_lib *l);
 const char *lib_error(struct nanum_lib *l);

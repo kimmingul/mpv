@@ -104,7 +104,8 @@ void nanum_dl_error_text(char *out, size_t sz, DWORD code)
     char text[900] = "";
     if (n)
         WideCharToMultiByte(CP_UTF8, 0, buf, -1, text, sizeof(text) - 1, NULL, NULL);
-    snprintf(out, sz, "%s (error %lu)", text[0] ? text : "unknown error", (unsigned long)code);
+    snprintf(out, sz, nanum_tr("%s (error %lu)"), text[0] ? text : nanum_tr("unknown error"),
+             (unsigned long)code);
 }
 
 static void narrow(const wchar_t *w, size_t wlen, char *out, size_t sz)
@@ -127,7 +128,7 @@ void nanum_dl_fail(struct nanum_dl *dl, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(dl->err, sizeof(dl->err), fmt, ap);
+    vsnprintf(dl->err, sizeof(dl->err), nanum_tr(fmt), ap);
     va_end(ap);
 }
 
@@ -206,8 +207,8 @@ static bool valid_sha(const char *s, char *out)
     return true;
 }
 
-bool nanum_dl_parse_item(mpv_node *m, const char *fallback_label,
-                         struct nanum_dl_item *out, char *err, size_t errsz)
+bool nanum_dl_parse_item(mpv_node *m, const char *fallback_label, bool bundled,
+                            struct nanum_dl_item *out, char *err, size_t errsz)
 {
     *out = (struct nanum_dl_item){0};
     const char *id = nanum_dl_node_str(m, "id");
@@ -216,22 +217,27 @@ bool nanum_dl_parse_item(mpv_node *m, const char *fallback_label,
     const char *url = nanum_dl_node_str(m, "url");
     const char *label = nanum_dl_node_str(m, "label");
     int64_t size = 0;
-    if (!file || !valid_filename(file) || !sha || !valid_sha(sha, out->sha) ||
-        !url || strlen(url) >= NANUM_DL_MAX_URL || _strnicmp(url, "https://", 8) ||
+    // A bundled item ships with the application and is never downloaded: no URL at all.
+    bool url_bad = bundled ? url != NULL || node_map_get(m, "url") != NULL
+                           : !url || strlen(url) >= NANUM_DL_MAX_URL ||
+                             _strnicmp(url, "https://", 8);
+    if (!file || !valid_filename(file) || !sha || !valid_sha(sha, out->sha) || url_bad ||
         !nanum_dl_node_int(m, "size", &size) || size <= 0 || size > MAX_ITEM_SIZE)
     {
-        snprintf(err, errsz, "catalog entry '%s' is invalid", id ? id : "?");
+        snprintf(err, errsz, nanum_tr("catalog entry '%s' is invalid"), id ? id : "?");
         *out = (struct nanum_dl_item){0};
         return false;
     }
     out->valid = true;
     out->size = size;
     snprintf(out->file, sizeof(out->file), "%s", file);
-    snprintf(out->url, sizeof(out->url), "%s", url);
+    if (url)
+        snprintf(out->url, sizeof(out->url), "%s", url);
     snprintf(out->label, sizeof(out->label), "%s",
              label && label[0] ? label : fallback_label);
     return true;
 }
+
 
 // ---------------------------------------------------------------------------
 // Job control
@@ -369,7 +375,7 @@ enum nanum_dl_res nanum_dl_hash(struct nanum_dl *dl, const struct nanum_dl_item 
     if (f == INVALID_HANDLE_VALUE) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot read %s: %s", path, why);
+        nanum_dl_fail(dl, N_("Cannot read %s: %s"), path, why);
         talloc_free(tmp);
         return NANUM_DL_FAIL;
     }
@@ -378,7 +384,7 @@ enum nanum_dl_res nanum_dl_hash(struct nanum_dl *dl, const struct nanum_dl_item 
     struct sha sha;
     if (!sha_begin(&sha)) {
         CloseHandle(f);
-        nanum_dl_fail(dl, "SHA-256 is not available (Windows CNG failed)");
+        nanum_dl_fail(dl, N_("SHA-256 is not available (Windows CNG failed)"));
         return NANUM_DL_FAIL;
     }
     phase(dl, NANUM_DL_VERIFYING, 0, item->size);
@@ -394,7 +400,7 @@ enum nanum_dl_res nanum_dl_hash(struct nanum_dl *dl, const struct nanum_dl_item 
         if (!ReadFile(f, dl->buf, NANUM_DL_IO_BUF, &got, NULL)) {
             char why[1024];
             nanum_dl_error_text(why, sizeof(why), GetLastError());
-            nanum_dl_fail(dl, "Cannot read %s: %s", path, why);
+            nanum_dl_fail(dl, N_("Cannot read %s: %s"), path, why);
             r = NANUM_DL_FAIL;
             break;
         }
@@ -411,7 +417,7 @@ enum nanum_dl_res nanum_dl_hash(struct nanum_dl *dl, const struct nanum_dl_item 
     }
     char hex[65] = "";
     if (!sha_finish(&sha, hex)) {
-        nanum_dl_fail(dl, "SHA-256 computation failed (Windows CNG)");
+        nanum_dl_fail(dl, N_("SHA-256 computation failed (Windows CNG)"));
         return NANUM_DL_FAIL;
     }
     *match = total == item->size && !strcmp(hex, item->sha);
@@ -429,7 +435,7 @@ static enum nanum_dl_res net_fail(struct nanum_dl *dl, const char *host, const c
     DWORD code = GetLastError();
     char why[1024];
     nanum_dl_error_text(why, sizeof(why), code);
-    const char *hint = "";
+    const char *hint = NULL;
     switch (code) {
     case ERROR_WINHTTP_SECURE_FAILURE:
     case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
@@ -439,27 +445,57 @@ static enum nanum_dl_res net_fail(struct nanum_dl *dl, const char *host, const c
     case ERROR_WINHTTP_SECURE_INVALID_CERT:
     case ERROR_WINHTTP_SECURE_CERT_REVOKED:
     case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
-        hint = " The TLS certificate of the server was rejected; the download was refused.";
+        hint = nanum_tr("The TLS certificate of the server was rejected; the download was "
+                        "refused.");
         break;
     case ERROR_WINHTTP_TIMEOUT:
-        hint = " The server did not answer in time.";
+        hint = nanum_tr("The server did not answer in time.");
         break;
     }
-    nanum_dl_fail(dl, "Network error while %s (%s): %s.%s", what, host, why, hint);
+    if (hint)
+        nanum_dl_fail(dl, N_("Network error while %s (%s): %s. %s"), what, host, why, hint);
+    else
+        nanum_dl_fail(dl, N_("Network error while %s (%s): %s."), what, host, why);
     return NANUM_DL_FAIL;
 }
 
-enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item *item,
-                                 const char *part)
-{
-    void *tmp = talloc_new(NULL);
-    enum nanum_dl_res r = NANUM_DL_FAIL;
-    HINTERNET session = NULL, conn = NULL, req = NULL;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    struct sha sha = {0};
-    char host[260] = "";
+// One HTTPS GET in flight (WinHTTP session, connection and request).
+struct http {
+    HINTERNET session, conn, req;
+    char host[260];
+};
 
-    wchar_t *wurl = W(tmp, item->url);
+// Whoever swaps dl->req out closes it; if a cancel did, it is gone.
+static void http_close(struct nanum_dl *dl, struct http *h)
+{
+    if (h->req) {
+        mp_mutex_lock(&dl->lock);
+        bool mine = dl->req == h->req;
+        if (mine)
+            dl->req = NULL;
+        mp_mutex_unlock(&dl->lock);
+        if (mine)
+            WinHttpCloseHandle(h->req);
+    }
+    if (h->conn)
+        WinHttpCloseHandle(h->conn);
+    if (h->session)
+        WinHttpCloseHandle(h->session);
+    *h = (struct http){0};
+}
+
+// The one place where a download starts: HTTPS only, certificate validation
+// never relaxed, redirects (HuggingFace and GitHub answer with a signed CDN
+// URL on another host, the key database with a relative one) followed by
+// WinHTTP with full validation per hop but never downgraded to plain HTTP,
+// finite timeouts, the request registered so that nanum_dl_abort() can stop
+// it. On NANUM_DL_OK h->req is positioned at the body of an HTTP 200 answer.
+// `label` names the data in messages, `what` the action in network errors.
+// The caller calls http_close() in every case.
+static enum nanum_dl_res http_get(struct nanum_dl *dl, void *tmp, const char *url,
+                                  const char *label, const char *what, struct http *h)
+{
+    wchar_t *wurl = W(tmp, url);
     wchar_t whost[256], wpath[2048], wextra[2048];
     URL_COMPONENTS uc = {
         .dwStructSize = sizeof(uc),
@@ -468,10 +504,10 @@ enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item
         .lpszExtraInfo = wextra, .dwExtraInfoLength = MP_ARRAY_SIZE(wextra),
     };
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) {
-        nanum_dl_fail(dl, "The catalog URL of %s is not a valid HTTPS URL", item->file);
-        goto out;
+        nanum_dl_fail(dl, N_("The URL of %s is not a valid HTTPS URL"), label);
+        return NANUM_DL_FAIL;
     }
-    narrow(whost, uc.dwHostNameLength, host, sizeof(host));
+    narrow(whost, uc.dwHostNameLength, h->host, sizeof(h->host));
     size_t plen = uc.dwUrlPathLength + uc.dwExtraInfoLength;
     wchar_t *wobj = talloc_array(tmp, wchar_t, plen + 1);
     wmemcpy(wobj, wpath, uc.dwUrlPathLength);
@@ -479,92 +515,99 @@ enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item
     wobj[plen] = 0;
     whost[uc.dwHostNameLength] = 0;
 
+    h->session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h->session)
+        h->session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h->session)
+        return net_fail(dl, h->host, nanum_tr("starting the HTTP session"));
+    WinHttpSetTimeouts(h->session, 30000, 30000, 30000, 60000);
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    if (!WinHttpSetOption(h->session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols,
+                          sizeof(protocols)))
+    {
+        protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        WinHttpSetOption(h->session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols,
+                         sizeof(protocols));
+    }
+    h->conn = WinHttpConnect(h->session, whost, uc.nPort, 0);
+    if (!h->conn)
+        return net_fail(dl, h->host, nanum_tr("connecting"));
+    h->req = WinHttpOpenRequest(h->conn, L"GET", wobj, NULL, WINHTTP_NO_REFERER,
+                                WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!h->req)
+        return net_fail(dl, h->host, nanum_tr("preparing the request"));
+    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(h->req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
+    if (!register_request(dl, h->req)) {
+        WinHttpCloseHandle(h->req);
+        h->req = NULL;
+        return NANUM_DL_CANCEL;
+    }
+
+    if (!WinHttpSendRequest(h->req, L"Accept-Encoding: identity\r\n", (DWORD)-1L,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(h->req, NULL))
+    {
+        return net_fail(dl, h->host, what);
+    }
+    DWORD code = 0, len = sizeof(code);
+    if (!WinHttpQueryHeaders(h->req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &len,
+                             WINHTTP_NO_HEADER_INDEX))
+    {
+        return net_fail(dl, h->host, nanum_tr("reading the response"));
+    }
+    if (code != 200) {
+        nanum_dl_fail(dl, N_("The server %s answered HTTP %lu instead of 200 for %s."), h->host,
+                      (unsigned long)code, label);
+        return NANUM_DL_FAIL;
+    }
+    return NANUM_DL_OK;
+}
+
+enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item *item,
+                                 const char *part)
+{
+    void *tmp = talloc_new(NULL);
+    enum nanum_dl_res r = NANUM_DL_FAIL;
+    struct http h = {0};
+    HANDLE file = INVALID_HANDLE_VALUE;
+    struct sha sha = {0};
+
     // Destination file, exclusive: this process owns the .part.
     file = CreateFileW(W(tmp, part), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot create %s: %s", part, why);
+        nanum_dl_fail(dl, N_("Cannot create %s: %s"), part, why);
         goto out;
     }
 
     phase(dl, NANUM_DL_CHECKING, 0, item->size);
 
-    session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session)
-        session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
-        r = net_fail(dl, host, "starting the HTTP session");
+    r = http_get(dl, tmp, item->url, item->file, nanum_tr("requesting the file"), &h);
+    if (r != NANUM_DL_OK)
         goto out;
-    }
-    WinHttpSetTimeouts(session, 30000, 30000, 30000, 60000);
-    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-    if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
-        protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    }
-    conn = WinHttpConnect(session, whost, uc.nPort, 0);
-    if (!conn) {
-        r = net_fail(dl, host, "connecting");
-        goto out;
-    }
-    req = WinHttpOpenRequest(conn, L"GET", wobj, NULL, WINHTTP_NO_REFERER,
-                             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!req) {
-        r = net_fail(dl, host, "preparing the request");
-        goto out;
-    }
-    // Redirects (HuggingFace and GitHub answer with a signed CDN URL on
-    // another host) are followed by WinHTTP with full certificate validation
-    // per hop; only a downgrade to plain HTTP is refused. Security flags are
-    // never relaxed.
-    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
-    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-    if (!register_request(dl, req)) {
-        WinHttpCloseHandle(req);
-        req = NULL;
-        r = NANUM_DL_CANCEL;
-        goto out;
-    }
+    r = NANUM_DL_FAIL;
 
-    if (!WinHttpSendRequest(req, L"Accept-Encoding: identity\r\n", (DWORD)-1L,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(req, NULL))
-    {
-        r = net_fail(dl, host, "requesting the file");
-        goto out;
-    }
-    DWORD code = 0, len = sizeof(code);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &len,
-                             WINHTTP_NO_HEADER_INDEX))
-    {
-        r = net_fail(dl, host, "reading the response");
-        goto out;
-    }
-    if (code != 200) {
-        nanum_dl_fail(dl, "The server %s answered HTTP %lu instead of 200 for %s.", host,
-                      (unsigned long)code, item->file);
-        goto out;
-    }
     wchar_t clen[32] = L"";
-    len = sizeof(clen);
-    if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
+    DWORD len = sizeof(clen);
+    if (WinHttpQueryHeaders(h.req, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
                             clen, &len, WINHTTP_NO_HEADER_INDEX))
     {
         unsigned long long announced = _wcstoui64(clen, NULL, 10);
         if (announced != (unsigned long long)item->size) {
-            nanum_dl_fail(dl, "The server %s announced %llu bytes for %s, expected %" PRId64
-                          " bytes.", host, announced, item->file, item->size);
+            nanum_dl_fail(dl, N_("The server %s announced %llu bytes for %s, expected %lld "
+                          "bytes."), h.host, announced, item->file, (long long)item->size);
             goto out;
         }
     }
 
     if (!sha_begin(&sha)) {
-        nanum_dl_fail(dl, "SHA-256 is not available (Windows CNG failed)");
+        nanum_dl_fail(dl, N_("SHA-256 is not available (Windows CNG failed)"));
         goto out;
     }
     phase(dl, NANUM_DL_DOWNLOADING, 0, item->size);
@@ -575,16 +618,16 @@ enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item
             goto out;
         }
         DWORD got = 0;
-        if (!WinHttpReadData(req, dl->buf, NANUM_DL_IO_BUF, &got)) {
-            r = net_fail(dl, host, "downloading");
+        if (!WinHttpReadData(h.req, dl->buf, NANUM_DL_IO_BUF, &got)) {
+            r = net_fail(dl, h.host, nanum_tr("downloading"));
             goto out;
         }
         if (!got)
             break;
         received += got;
         if (received > item->size) {
-            nanum_dl_fail(dl, "The server %s sent more than the expected %" PRId64
-                          " bytes for %s.", host, item->size, item->file);
+            nanum_dl_fail(dl, N_("The server %s sent more than the expected %lld "
+                          "bytes for %s."), h.host, (long long)item->size, item->file);
             goto out;
         }
         DWORD written = 0;
@@ -593,33 +636,34 @@ enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item
         {
             char why[1024];
             nanum_dl_error_text(why, sizeof(why), GetLastError());
-            nanum_dl_fail(dl, "Cannot write %s: %s", part, why);
+            nanum_dl_fail(dl, N_("Cannot write %s: %s"), part, why);
             goto out;
         }
         progress(dl, received);
     }
     if (received != item->size) {
-        nanum_dl_fail(dl, "The download of %s ended after %" PRId64 " of %" PRId64
-                      " bytes (connection closed early).", item->file, received, item->size);
+        nanum_dl_fail(dl, N_("The download of %s ended after %lld of %lld "
+                      "bytes (connection closed early)."), item->file, (long long)received,
+                      (long long)item->size);
         goto out;
     }
 
     phase(dl, NANUM_DL_VERIFYING, received, item->size);
     char hex[65] = "";
     if (!sha_finish(&sha, hex)) {
-        nanum_dl_fail(dl, "SHA-256 computation failed (Windows CNG)");
+        nanum_dl_fail(dl, N_("SHA-256 computation failed (Windows CNG)"));
         goto out;
     }
     if (strcmp(hex, item->sha)) {
-        nanum_dl_fail(dl, "SHA-256 mismatch for %s from %s: expected %s, got %s. "
-                      "The file was discarded and nothing was installed.", item->file, host,
+        nanum_dl_fail(dl, N_("SHA-256 mismatch for %s from %s: expected %s, got %s. "
+                      "The file was discarded and nothing was installed."), item->file, h.host,
                       item->sha, hex);
         goto out;
     }
     if (!FlushFileBuffers(file)) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot write %s: %s", part, why);
+        nanum_dl_fail(dl, N_("Cannot write %s: %s"), part, why);
         goto out;
     }
     r = NANUM_DL_OK;
@@ -630,20 +674,7 @@ out:
     sha_free(&sha);
     if (file != INVALID_HANDLE_VALUE)
         CloseHandle(file);
-    if (req) {
-        // Whoever swaps dl->req out closes it; if the cancel did, it is gone.
-        mp_mutex_lock(&dl->lock);
-        bool mine = dl->req == req;
-        if (mine)
-            dl->req = NULL;
-        mp_mutex_unlock(&dl->lock);
-        if (mine)
-            WinHttpCloseHandle(req);
-    }
-    if (conn)
-        WinHttpCloseHandle(conn);
-    if (session)
-        WinHttpCloseHandle(session);
+    http_close(dl, &h);
     talloc_free(tmp);
     return r;
 }
@@ -653,101 +684,30 @@ enum nanum_dl_res nanum_dl_get_text(struct nanum_dl *dl, const char *url, int64_
 {
     void *tmp = talloc_new(NULL);
     enum nanum_dl_res r = NANUM_DL_FAIL;
-    HINTERNET session = NULL, conn = NULL, req = NULL;
-    char host[260] = "";
+    struct http h = {0};
     char *text = NULL;
     size_t used = 0;
 
-    wchar_t *wurl = W(tmp, url);
-    wchar_t whost[256], wpath[2048], wextra[2048];
-    URL_COMPONENTS uc = {
-        .dwStructSize = sizeof(uc),
-        .lpszHostName = whost, .dwHostNameLength = MP_ARRAY_SIZE(whost),
-        .lpszUrlPath = wpath, .dwUrlPathLength = MP_ARRAY_SIZE(wpath),
-        .lpszExtraInfo = wextra, .dwExtraInfoLength = MP_ARRAY_SIZE(wextra),
-    };
-    if (!WinHttpCrackUrl(wurl, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) {
-        nanum_dl_fail(dl, "%s is not a valid HTTPS URL", url);
-        goto out;
-    }
-    narrow(whost, uc.dwHostNameLength, host, sizeof(host));
-    size_t plen = uc.dwUrlPathLength + uc.dwExtraInfoLength;
-    wchar_t *wobj = talloc_array(tmp, wchar_t, plen + 1);
-    wmemcpy(wobj, wpath, uc.dwUrlPathLength);
-    wmemcpy(wobj + uc.dwUrlPathLength, wextra, uc.dwExtraInfoLength);
-    wobj[plen] = 0;
-    whost[uc.dwHostNameLength] = 0;
-
     phase(dl, NANUM_DL_CHECKING, 0, 0);
-    session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session)
-        session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
-        r = net_fail(dl, host, "starting the HTTP session");
+    r = http_get(dl, tmp, url, url, nanum_tr("requesting the release information"), &h);
+    if (r != NANUM_DL_OK)
         goto out;
-    }
-    WinHttpSetTimeouts(session, 30000, 30000, 30000, 60000);
-    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-    if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
-        protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    }
-    conn = WinHttpConnect(session, whost, uc.nPort, 0);
-    if (!conn) {
-        r = net_fail(dl, host, "connecting");
-        goto out;
-    }
-    req = WinHttpOpenRequest(conn, L"GET", wobj, NULL, WINHTTP_NO_REFERER,
-                             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!req) {
-        r = net_fail(dl, host, "preparing the request");
-        goto out;
-    }
-    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
-    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-    if (!register_request(dl, req)) {
-        WinHttpCloseHandle(req);
-        req = NULL;
-        r = NANUM_DL_CANCEL;
-        goto out;
-    }
-    if (!WinHttpSendRequest(req, L"Accept-Encoding: identity\r\n", (DWORD)-1L,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(req, NULL))
-    {
-        r = net_fail(dl, host, "requesting the release information");
-        goto out;
-    }
-    DWORD code = 0, len = sizeof(code);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &len,
-                             WINHTTP_NO_HEADER_INDEX))
-    {
-        r = net_fail(dl, host, "reading the response");
-        goto out;
-    }
-    if (code != 200) {
-        nanum_dl_fail(dl, "The server %s answered HTTP %lu instead of 200 for %s.", host,
-                      (unsigned long)code, url);
-        goto out;
-    }
+    r = NANUM_DL_FAIL;
     for (;;) {
         if (nanum_dl_cancelled(dl)) {
             r = NANUM_DL_CANCEL;
             goto out;
         }
         DWORD got = 0;
-        if (!WinHttpReadData(req, dl->buf, NANUM_DL_IO_BUF, &got)) {
-            r = net_fail(dl, host, "downloading");
+        if (!WinHttpReadData(h.req, dl->buf, NANUM_DL_IO_BUF, &got)) {
+            r = net_fail(dl, h.host, nanum_tr("downloading"));
             goto out;
         }
         if (!got)
             break;
         if ((int64_t)(used + got) > max) {
-            nanum_dl_fail(dl, "The answer of %s for %s is larger than %" PRId64 " bytes.", host,
-                          url, max);
+            nanum_dl_fail(dl, N_("The answer of %s for %s is larger than %lld bytes."),
+                          h.host, url, (long long)max);
             goto out;
         }
         text = talloc_realloc(ctx, text, char, used + got + 1);
@@ -764,19 +724,80 @@ out:
     if (r == NANUM_DL_FAIL && nanum_dl_cancelled(dl))
         r = NANUM_DL_CANCEL;
     talloc_free(text);
-    if (req) {
-        mp_mutex_lock(&dl->lock);
-        bool mine = dl->req == req;
-        if (mine)
-            dl->req = NULL;
-        mp_mutex_unlock(&dl->lock);
-        if (mine)
-            WinHttpCloseHandle(req);
+    http_close(dl, &h);
+    talloc_free(tmp);
+    return r;
+}
+
+enum nanum_dl_res nanum_dl_stream_unpinned(struct nanum_dl *dl, const char *url, int64_t max,
+                                           nanum_dl_sink_fn sink, void *sink_user,
+                                           int64_t *received_out)
+{
+    void *tmp = talloc_new(NULL);
+    enum nanum_dl_res r = NANUM_DL_FAIL;
+    struct http h = {0};
+    int64_t received = 0, announced = -1;
+
+    phase(dl, NANUM_DL_CHECKING, 0, 0);
+    r = http_get(dl, tmp, url, url, nanum_tr("requesting the data"), &h);
+    if (r != NANUM_DL_OK)
+        goto out;
+    r = NANUM_DL_FAIL;
+
+    wchar_t clen[32] = L"";
+    DWORD len = sizeof(clen);
+    if (WinHttpQueryHeaders(h.req, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
+                            clen, &len, WINHTTP_NO_HEADER_INDEX))
+    {
+        unsigned long long v = _wcstoui64(clen, NULL, 10);
+        if (v > (unsigned long long)max) {
+            nanum_dl_fail(dl, N_("The server %s announced %llu bytes, more than the allowed "
+                          "%lld bytes."), h.host, v, (long long)max);
+            goto out;
+        }
+        announced = (int64_t)v;
     }
-    if (conn)
-        WinHttpCloseHandle(conn);
-    if (session)
-        WinHttpCloseHandle(session);
+
+    phase(dl, NANUM_DL_DOWNLOADING, 0, announced < 0 ? 0 : announced);
+    for (;;) {
+        if (nanum_dl_cancelled(dl)) {
+            r = NANUM_DL_CANCEL;
+            goto out;
+        }
+        DWORD got = 0;
+        if (!WinHttpReadData(h.req, dl->buf, NANUM_DL_IO_BUF, &got)) {
+            r = net_fail(dl, h.host, nanum_tr("downloading"));
+            goto out;
+        }
+        if (!got)
+            break;
+        received += got;
+        if (received > max || (announced >= 0 && received > announced)) {
+            nanum_dl_fail(dl, N_("The server %s sent more than the allowed %lld bytes."),
+                          h.host, (long long)(announced >= 0 ? announced : max));
+            goto out;
+        }
+        if (!sink(sink_user, dl->buf, got)) {
+            if (!dl->err[0])
+                nanum_dl_fail(dl, N_("The downloaded data could not be processed."));
+            goto out;
+        }
+        progress(dl, received);
+    }
+    if (announced >= 0 && received != announced) {
+        nanum_dl_fail(dl, N_("The download from %s ended after %lld of %lld "
+                      "bytes (connection closed early)."), h.host, (long long)received,
+                      (long long)announced);
+        goto out;
+    }
+    if (received_out)
+        *received_out = received;
+    r = NANUM_DL_OK;
+
+out:
+    if (r == NANUM_DL_FAIL && nanum_dl_cancelled(dl))
+        r = NANUM_DL_CANCEL;
+    http_close(dl, &h);
     talloc_free(tmp);
     return r;
 }
@@ -794,7 +815,7 @@ bool nanum_dl_prepare_dir(struct nanum_dl *dl, const char *final_path, int64_t n
     if (ec != ERROR_SUCCESS && ec != ERROR_ALREADY_EXISTS && ec != ERROR_FILE_EXISTS) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), ec);
-        nanum_dl_fail(dl, "Cannot create the folder %s: %s", dir, why);
+        nanum_dl_fail(dl, N_("Cannot create the folder %s: %s"), dir, why);
         talloc_free(tmp);
         return false;
     }
@@ -802,9 +823,9 @@ bool nanum_dl_prepare_dir(struct nanum_dl *dl, const char *final_path, int64_t n
     if (GetDiskFreeSpaceExW(wdir, &avail, NULL, NULL) &&
         avail.QuadPart < (uint64_t)(needed + DISK_HEADROOM))
     {
-        nanum_dl_fail(dl, "Not enough free disk space for %s in %s: %" PRId64 " MiB needed, %"
-                      PRIu64 " MiB available.", what, dir, (needed + DISK_HEADROOM) >> 20,
-                      (uint64_t)(avail.QuadPart >> 20));
+        nanum_dl_fail(dl, N_("Not enough free disk space for %s in %s: %lld MiB needed, %"
+                      "llu MiB available."), what, dir, (long long)((needed + DISK_HEADROOM) >> 20),
+                      (unsigned long long)(avail.QuadPart >> 20));
         talloc_free(tmp);
         return false;
     }
@@ -855,9 +876,11 @@ enum nanum_dl_res nanum_dl_install(struct nanum_dl *dl, const struct nanum_dl_it
     char why[1024];
     DWORD last = GetLastError();
     nanum_dl_error_text(why, sizeof(why), last);
-    nanum_dl_fail(dl, "Cannot install %s: %s%s", final_path, why,
-                  last == ERROR_SHARING_VIOLATION || last == ERROR_ACCESS_DENIED
-                      ? " The file may be in use by a playing file; close it and retry." : "");
+    if (last == ERROR_SHARING_VIOLATION || last == ERROR_ACCESS_DENIED)
+        nanum_dl_fail(dl, N_("Cannot install %s: %s %s"), final_path, why,
+                      nanum_tr("The file may be in use by a playing file; close it and retry."));
+    else
+        nanum_dl_fail(dl, N_("Cannot install %s: %s"), final_path, why);
 out:
     talloc_free(tmp);
     return r;

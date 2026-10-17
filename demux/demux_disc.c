@@ -109,6 +109,7 @@ struct priv {
     bool eof_log_still;
 
     bool is_dvd, is_dvda, is_cdda, is_bd;
+    bool genpts;        // the slave generates absent PTS (set by the opener)
 
     // DVD-Audio still-image video track.
     struct sh_stream *still_sh;
@@ -722,6 +723,7 @@ static bool reopen_slave(struct demuxer *demuxer)
         .external_stream = demuxer->stream,
         .stream_flags = demuxer->stream_origin,
         .depth = demuxer->depth + 1,
+        .genpts = p->genpts,
     };
     if (p->is_cdda)
         params.force_format = "+rawaudio";
@@ -1148,7 +1150,9 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
         .external_stream = demuxer->stream,
         .stream_flags = demuxer->stream_origin,
         .depth = demuxer->depth + 1,
+        .genpts = demuxer->params && demuxer->params->genpts,
     };
+    p->genpts = params.genpts;
 
     struct stream *cur = demuxer->stream;
     const char *sname = "";

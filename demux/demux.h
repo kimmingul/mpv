@@ -221,6 +221,7 @@ struct demuxer_params {
     bool skip_lavf_probing;
     bool stream_record; // if true, enable stream recording if option is set
     int stream_flags;
+    bool genpts;       // lavf: generate absent PTS by look-ahead (lossless stream copy)
     struct stream *external_stream; // if set, use this, don't open or close streams
     bool allow_playlist_create;
     // result

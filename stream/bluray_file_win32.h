@@ -4,7 +4,7 @@
  * libbluray reads the disc through a replaceable file-open function
  * (bd_register_file(), the process-wide hook libbluray offers for this; unlike
  * bd_open_files() it keeps bd_open(device path) and so the device path that
- * libaacs/libmmbd (MakeMKV) use for decryption). The default implementation is
+ * libaacs uses for decryption). The default implementation is
  * fread(), which reports a failure only as a short count: the OS error is lost
  * before libbluray can log "Read unit at N failed".
  *

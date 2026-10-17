@@ -78,7 +78,7 @@ static const struct {
     [C_YTDLP] = {"yt-dlp", "yt-dlp", "yt-dlp.exe",
                  "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
                  "yt-dlp.exe", "SHA2-256SUMS"},
-    [C_DENO]  = {"deno", "Deno (JavaScript 실행기)", "deno.exe",
+    [C_DENO]  = {"deno", N_("Deno (JavaScript 실행기)"), "deno.exe",
                  "https://api.github.com/repos/denoland/deno/releases/latest",
                  "deno-x86_64-pc-windows-msvc.zip", NULL},
 };
@@ -326,14 +326,14 @@ static enum nanum_dl_res get_release(int i, struct rel *rel)
     char *p = json;
     mpv_node doc;
     if (json_parse(tmp, &doc, &p, MAX_JSON_DEPTH) < 0 || doc.format != MPV_FORMAT_NODE_MAP) {
-        nanum_dl_fail(dl, "The release information of %s is not valid JSON.", KNOWN[i].id);
+        nanum_dl_fail(dl, N_("The release information of %s is not valid JSON."), KNOWN[i].id);
         r = NANUM_DL_FAIL;
         goto out;
     }
     const char *tag = nanum_dl_node_str(&doc, "tag_name");
     mpv_node *assets = node_map_get(&doc, "assets");
     if (!tag || !valid_tag(tag) || !assets || assets->format != MPV_FORMAT_NODE_ARRAY) {
-        nanum_dl_fail(dl, "The latest %s release has an unexpected format.", KNOWN[i].id);
+        nanum_dl_fail(dl, N_("The latest %s release has an unexpected format."), KNOWN[i].id);
         r = NANUM_DL_FAIL;
         goto out;
     }
@@ -350,7 +350,7 @@ static enum nanum_dl_res get_release(int i, struct rel *rel)
     if (!asset || !sumsa || !url || !surl || !nanum_dl_node_int(asset, "size", &size) ||
         size <= 0 || strlen(url) >= NANUM_DL_MAX_URL)
     {
-        nanum_dl_fail(dl, "The %s release %s has no %s with a checksum (%s).", KNOWN[i].id,
+        nanum_dl_fail(dl, N_("The %s release %s has no %s with a checksum (%s)."), KNOWN[i].id,
                       tag, KNOWN[i].asset, sums_name);
         r = NANUM_DL_FAIL;
         goto out;
@@ -359,7 +359,7 @@ static enum nanum_dl_res get_release(int i, struct rel *rel)
         goto out;
     struct nanum_dl_item *it = &rel->item;
     if (!find_sha(sums, KNOWN[i].sums ? KNOWN[i].asset : NULL, it->sha)) {
-        nanum_dl_fail(dl, "The checksum file %s of the %s release %s has no SHA-256 for %s.",
+        nanum_dl_fail(dl, N_("The checksum file %s of the %s release %s has no SHA-256 for %s."),
                       sums_name, KNOWN[i].id, tag, KNOWN[i].asset);
         r = NANUM_DL_FAIL;
         goto out;
@@ -409,7 +409,7 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
                      FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     LARGE_INTEGER zsize;
     if (in == INVALID_HANDLE_VALUE || !GetFileSizeEx(in, &zsize) || zsize.QuadPart < 22) {
-        nanum_dl_fail(dl, "Cannot read %s.", zip);
+        nanum_dl_fail(dl, N_("Cannot read %s."), zip);
         goto out;
     }
     // End of central directory (no zip64: the entry is far below 4 GiB).
@@ -417,26 +417,26 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
     DWORD tn = (DWORD)MPMIN((int64_t)sizeof(tail), zsize.QuadPart);
     int64_t tail_off = zsize.QuadPart - tn;
     if (!read_at(in, tail_off, tail, tn)) {
-        nanum_dl_fail(dl, "Cannot read %s.", zip);
+        nanum_dl_fail(dl, N_("Cannot read %s."), zip);
         goto out;
     }
     int e = (int)tn - 22;
     while (e >= 0 && le32(tail + e) != 0x06054b50)
         e--;
     if (e < 0) {
-        nanum_dl_fail(dl, "%s is not a zip file.", zip);
+        nanum_dl_fail(dl, N_("%s is not a zip file."), zip);
         goto out;
     }
     uint32_t cd_size = le32(tail + e + 12), cd_off = le32(tail + e + 16);
     if (cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu || cd_size > (1u << 20) ||
         (int64_t)cd_off + cd_size > zsize.QuadPart)
     {
-        nanum_dl_fail(dl, "The zip directory of %s is unsupported.", zip);
+        nanum_dl_fail(dl, N_("The zip directory of %s is unsupported."), zip);
         goto out;
     }
     uint8_t *cd = talloc_size(tmp, cd_size + 1);
     if (!read_at(in, cd_off, cd, cd_size)) {
-        nanum_dl_fail(dl, "Cannot read %s.", zip);
+        nanum_dl_fail(dl, N_("Cannot read %s."), zip);
         goto out;
     }
     uint32_t method = 0, crc = 0, csize = 0, usize = 0, lho = 0;
@@ -460,12 +460,12 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
     if (!found || (method != 0 && method != 8) || csize == 0xFFFFFFFFu ||
         usize == 0xFFFFFFFFu || !read_at(in, lho, lh, sizeof(lh)) || le32(lh) != 0x04034b50)
     {
-        nanum_dl_fail(dl, "%s has no usable %s.", zip, name);
+        nanum_dl_fail(dl, N_("%s has no usable %s."), zip, name);
         goto out;
     }
     int64_t data = (int64_t)lho + 30 + le16(lh + 26) + le16(lh + 28);
     if (data + csize > zsize.QuadPart) {
-        nanum_dl_fail(dl, "%s is truncated.", zip);
+        nanum_dl_fail(dl, N_("%s is truncated."), zip);
         goto out;
     }
     if (!nanum_dl_prepare_dir(dl, out, usize, name))
@@ -475,13 +475,13 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
     if (of == INVALID_HANDLE_VALUE) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot create %s: %s", out, why);
+        nanum_dl_fail(dl, N_("Cannot create %s: %s"), out, why);
         goto out;
     }
     obuf = talloc_size(tmp, NANUM_DL_IO_BUF);
     if (method == 8) {
         if (inflateInit2(&z, -MAX_WBITS) != Z_OK) {
-            nanum_dl_fail(dl, "zlib failed to start.");
+            nanum_dl_fail(dl, N_("zlib failed to start."));
             goto out;
         }
         zinit = true;
@@ -504,7 +504,7 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
             if (!want)
                 break;
             if (!read_at(in, data + done_in, obuf, want)) {
-                nanum_dl_fail(dl, "Cannot read %s.", zip);
+                nanum_dl_fail(dl, N_("Cannot read %s."), zip);
                 goto out;
             }
             done_in += want;
@@ -513,11 +513,11 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
             if (!z.avail_in) {
                 want = (DWORD)MPMIN((uint32_t)NANUM_DL_IO_BUF, csize - done_in);
                 if (!want) {
-                    nanum_dl_fail(dl, "%s is corrupt (unexpected end of %s).", zip, name);
+                    nanum_dl_fail(dl, N_("%s is corrupt (unexpected end of %s)."), zip, name);
                     goto out;
                 }
                 if (!read_at(in, data + done_in, dl->buf, want)) {
-                    nanum_dl_fail(dl, "Cannot read %s.", zip);
+                    nanum_dl_fail(dl, N_("Cannot read %s."), zip);
                     goto out;
                 }
                 done_in += want;
@@ -528,7 +528,7 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
             z.avail_out = NANUM_DL_IO_BUF;
             int zr = inflate(&z, Z_NO_FLUSH);
             if (zr != Z_OK && zr != Z_STREAM_END) {
-                nanum_dl_fail(dl, "%s is corrupt (zlib error %d in %s).", zip, zr, name);
+                nanum_dl_fail(dl, N_("%s is corrupt (zlib error %d in %s)."), zip, zr, name);
                 goto out;
             }
             end = zr == Z_STREAM_END;
@@ -543,23 +543,24 @@ static enum nanum_dl_res unzip_entry(struct nanum_dl *dl, int comp, const char *
             {
                 char why[1024];
                 nanum_dl_error_text(why, sizeof(why), GetLastError());
-                nanum_dl_fail(dl, total_out > usize ? "%s: %s is larger than announced."
-                                                    : "Cannot write %s: %s",
-                              total_out > usize ? zip : out, total_out > usize ? name : why);
+                if (total_out > usize)
+                    nanum_dl_fail(dl, N_("%s: %s is larger than announced."), zip, name);
+                else
+                    nanum_dl_fail(dl, N_("Cannot write %s: %s"), out, why);
                 goto out;
             }
             set_progress((int64_t)total_out, false);
         }
     }
     if (total_out != usize || sum != crc) {
-        nanum_dl_fail(dl, "%s from %s failed the size/CRC check; nothing was installed.", name,
+        nanum_dl_fail(dl, N_("%s from %s failed the size/CRC check; nothing was installed."), name,
                       zip);
         goto out;
     }
     if (!FlushFileBuffers(of)) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot write %s: %s", out, why);
+        nanum_dl_fail(dl, N_("Cannot write %s: %s"), out, why);
         goto out;
     }
     r = NANUM_DL_OK;
@@ -647,7 +648,7 @@ static enum nanum_dl_res install_deno(const struct rel *rel)
     if (!MoveFileExW(W(tmp, exe), W(tmp, path), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         char why[1024];
         nanum_dl_error_text(why, sizeof(why), GetLastError());
-        nanum_dl_fail(dl, "Cannot install %s: %s", path, why);
+        nanum_dl_fail(dl, N_("Cannot install %s: %s"), path, why);
         DeleteFileW(W(tmp, exe));
         r = NANUM_DL_FAIL;
         goto out;
@@ -725,7 +726,7 @@ static void publish(struct MPContext *mpctx)
     int cur = g.cur;
     int64_t recv = g.recv, total = g.total;
     bool running = g.running;
-    char err[sizeof(g.err)], latest[sizeof(g.latest)];
+    char err[sizeof(g.err)], err_text[sizeof(g.err)], latest[sizeof(g.latest)];
     memcpy(err, g.err, sizeof(err));
     memcpy(latest, g.latest, sizeof(latest));
     int64_t asize[C_COUNT];
@@ -745,7 +746,8 @@ static void publish(struct MPContext *mpctx)
     node_map_add_string(&root, "current", cur >= 0 && cur < C_COUNT ? KNOWN[cur].id : "");
     node_map_add_int64(&root, "received", recv);
     node_map_add_int64(&root, "total", total);
-    node_map_add_string(&root, "error", err);
+    nanum_msg_render(err, err_text, sizeof(err_text));
+    node_map_add_string(&root, "error", err_text);
     node_map_add_string(&root, "directory", g.dir ? g.dir : "");
     node_map_add_string(&root, "bin", g.bin ? g.bin : "");
     node_map_add_flag(&root, "busy", running);
@@ -765,7 +767,7 @@ static void publish(struct MPContext *mpctx)
         bool have = p && nanum_dl_stat(p, &f);
         mpv_node *m = node_array_add(arr, MPV_FORMAT_NODE_MAP);
         node_map_add_string(m, "id", KNOWN[i].id);
-        node_map_add_string(m, "label", KNOWN[i].label);
+        node_map_add_string(m, "label", nanum_tr(KNOWN[i].label));
         node_map_add_string(m, "filename", KNOWN[i].file);
         node_map_add_int64(m, "size", inst[i] && have ? f.size : asize[i]);
         node_map_add_flag(m, "installed", inst[i]);
@@ -817,32 +819,37 @@ void nanum_youtube_publish(struct MPContext *mpctx)
     publish(mpctx);
 }
 
-// Records a rejected request as the (terminal) state, unless a worker runs.
-static bool reject(struct MPContext *mpctx, const char *fmt, ...) MP_PRINTF_ATTRIBUTE(2, 3);
-static bool reject(struct MPContext *mpctx, const char *fmt, ...)
+// Records a rejected request (a stored message, see NANUM_MSG) as the (terminal) state,
+// unless a worker runs.
+static bool reject(struct MPContext *mpctx, const char *stored)
 {
-    char msg[640];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-    MP_ERR(mpctx, "%s\n", msg);
+    char en[640];
+    nanum_msg_render_lang(stored, en, sizeof(en), NANUM_UI_EN);
+    MP_ERR(mpctx, "%s\n", en);
     mp_mutex_lock(&g_lock);
     if (!g.running) {
         g.st = ST_ERROR;
         g.cur = -1;
         g.recv = g.total = 0;
-        snprintf(g.err, sizeof(g.err), "%s", msg);
+        snprintf(g.err, sizeof(g.err), "%s", stored);
     }
     mp_mutex_unlock(&g_lock);
     publish(mpctx);
     return false;
 }
 
+// key: a message without arguments.
+static bool reject_key(struct MPContext *mpctx, const char *key)
+{
+    char stored[640];
+    NANUM_MSG(stored, key);
+    return reject(mpctx, stored);
+}
+
 static bool start_job(struct MPContext *mpctx, enum mode mode)
 {
     if (!g.init)
-        return reject(mpctx, "The YouTube component manager is not initialized.");
+        return reject_key(mpctx, N_("The YouTube component manager is not initialized."));
     mp_mutex_lock(&g_lock);
     bool down = g.shutting_down, busy = g.running;
     mp_mutex_unlock(&g_lock);
@@ -857,10 +864,10 @@ static bool start_job(struct MPContext *mpctx, enum mode mode)
         g.thread_valid = false;
     }
     if (!g.bin)
-        return reject(mpctx, "The YouTube component folder cannot be determined "
-                      "(%%LOCALAPPDATA%% is unavailable).");
+        return reject_key(mpctx, N_("The YouTube component folder cannot be determined "
+                          "(%%LOCALAPPDATA%% is unavailable)."));
     if (!nanum_dl_begin(&g.dl))
-        return reject(mpctx, "Out of memory.");
+        return reject_key(mpctx, N_("Out of memory."));
     mp_mutex_lock(&g_lock);
     g.running = true;
     g.mode = mode;
@@ -876,7 +883,7 @@ static bool start_job(struct MPContext *mpctx, enum mode mode)
         g.running = false;
         mp_mutex_unlock(&g_lock);
         nanum_dl_end(&g.dl);
-        return reject(mpctx, "Cannot start the YouTube component thread.");
+        return reject_key(mpctx, N_("Cannot start the YouTube component thread."));
     }
     g.thread_valid = true;
     publish(mpctx);

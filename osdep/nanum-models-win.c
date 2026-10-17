@@ -73,11 +73,11 @@ static const struct {
     const char *file;       // used only while the catalog is unavailable
     const char *label;
 } KNOWN[M_COUNT] = {
-    [M_EN]    = {"english",      "nanum-stt-model",              "ggml-small.en.bin",      "Whisper small.en"},
-    [M_MULTI] = {"multilingual", "nanum-stt-model-multilingual", "ggml-small.bin",         "Whisper small"},
-    [M_VAD]   = {"vad",          "nanum-vad-model",              "ggml-silero-v5.1.2.bin", "Silero VAD"},
+    [M_EN]    = {"english",      "nanum-stt-model",              "ggml-small.en.bin",      N_("Whisper small.en (영어)")},
+    [M_MULTI] = {"multilingual", "nanum-stt-model-multilingual", "ggml-small.bin",         N_("Whisper small (다국어)")},
+    [M_VAD]   = {"vad",          "nanum-vad-model",              "ggml-silero-v5.1.2.bin", N_("Silero VAD (음성 감지)")},
     [M_MULTI_LARGE] = {"multilingual_large", "nanum-stt-model-multilingual", "ggml-large-v3-turbo-q5_0.bin",
-                       "Whisper large-v3-turbo"},
+                       N_("Whisper large-v3-turbo (다국어 고정밀)")},
 };
 
 enum kind { KIND_USER, KIND_APP, KIND_CUSTOM };
@@ -151,15 +151,12 @@ static char *app_path(void *ctx, int i)
 // Catalog
 // ---------------------------------------------------------------------------
 
-static void catalog_fail(const char *fmt, ...) MP_PRINTF_ATTRIBUTE(1, 2);
-static void catalog_fail(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(g.cat_err, sizeof(g.cat_err), fmt, ap);
-    va_end(ap);
-    g.cat_ok = false;
-}
+// Stored (re-translatable) message: key with %s arguments only.
+#define catalog_fail(...) \
+    do { \
+        NANUM_MSG(g.cat_err, __VA_ARGS__); \
+        g.cat_ok = false; \
+    } while (0)
 
 static void load_catalog(void)
 {
@@ -177,8 +174,11 @@ static void load_catalog(void)
         text = nanum_dl_read_text(tmp, path);
     }
     if (!text) {
-        catalog_fail("model catalog models\\catalog.json not found or unreadable%s%s",
-                     path ? ": " : "", path ? path : "");
+        if (path)
+            catalog_fail(N_("model catalog models\\catalog.json not found or unreadable: %s"),
+                         path);
+        else
+            catalog_fail(N_("model catalog models\\catalog.json not found or unreadable"));
         goto done;
     }
 
@@ -187,7 +187,7 @@ static void load_catalog(void)
         p += 3;
     mpv_node doc;
     if (json_parse(tmp, &doc, &p, MAX_JSON_DEPTH) < 0 || doc.format != MPV_FORMAT_NODE_MAP) {
-        catalog_fail("model catalog %s is not valid JSON", path);
+        catalog_fail(N_("model catalog %s is not valid JSON"), path);
         goto done;
     }
     int64_t schema = 0;
@@ -195,7 +195,7 @@ static void load_catalog(void)
     if (!nanum_dl_node_int(&doc, "schema", &schema) || schema != 1 || !models ||
         models->format != MPV_FORMAT_NODE_ARRAY)
     {
-        catalog_fail("model catalog %s has an unsupported format (schema 1 expected)", path);
+        catalog_fail(N_("model catalog %s has an unsupported format (schema 1 expected)"), path);
         goto done;
     }
 
@@ -211,8 +211,8 @@ static void load_catalog(void)
             continue;
         struct nanum_dl_item e;
         char why[256];
-        if (!nanum_dl_parse_item(m, KNOWN[i].label, &e, why, sizeof(why))) {
-            catalog_fail("model %s", why);
+        if (!nanum_dl_parse_item(m, KNOWN[i].label, false, &e, why, sizeof(why))) {
+            catalog_fail(N_("model catalog entry '%s' is invalid"), id ? id : "?");
             continue;
         }
         g.cat[i] = e;
@@ -223,7 +223,7 @@ static void load_catalog(void)
         if (!g.cat[i].valid) {
             all = false;
             if (!g.cat_err[0])
-                catalog_fail("model catalog has no entry for '%s'", KNOWN[i].id);
+                catalog_fail(N_("model catalog has no entry for '%s'"), KNOWN[i].id);
         }
     }
     g.cat_ok = all;
@@ -324,8 +324,8 @@ static enum nanum_dl_res process_model(struct jmodel *m)
                     KNOWN[m->idx].option);
             return NANUM_DL_OK;
         }
-        nanum_dl_fail(dl, "--%s is set to %s, which does not exist. Fix or remove that option "
-                      "(downloads never overwrite custom model paths).",
+        nanum_dl_fail(dl, N_("--%s is set to %s, which does not exist. Fix or remove that option "
+                      "(downloads never overwrite custom model paths)."),
                       KNOWN[m->idx].option, m->path);
         return NANUM_DL_FAIL;
     }
@@ -343,13 +343,13 @@ static enum nanum_dl_res process_model(struct jmodel *m)
             }
         }
         if (m->kind == KIND_APP) {
-            nanum_dl_fail(dl, "%s does not match the pinned model (wrong size or SHA-256). It is "
-                          "not modified; replace or delete it to use the downloaded model.",
+            nanum_dl_fail(dl, N_("%s does not match the pinned model (wrong size or SHA-256). It is "
+                          "not modified; replace or delete it to use the downloaded model."),
                           m->path);
             return NANUM_DL_FAIL;
         }
     } else if (m->kind == KIND_APP) {
-        nanum_dl_fail(dl, "%s is in use but no longer exists.", m->path);
+        nanum_dl_fail(dl, N_("%s is in use but no longer exists."), m->path);
         return NANUM_DL_FAIL;
     }
 
@@ -497,7 +497,7 @@ static void publish(struct MPContext *mpctx)
     int cur = g.cur;
     int64_t recv = g.recv, total = g.total;
     bool running = g.running;
-    char err[sizeof(g.err)];
+    char err[sizeof(g.err)], err_text[sizeof(g.err)], cat_err_text[sizeof(g.cat_err)];
     memcpy(err, g.err, sizeof(err));
     mp_mutex_unlock(&g_lock);
 
@@ -509,11 +509,13 @@ static void publish(struct MPContext *mpctx)
     node_map_add_string(&root, "current", cur >= 0 && cur < M_COUNT ? KNOWN[cur].id : "");
     node_map_add_int64(&root, "received", recv);
     node_map_add_int64(&root, "total", total);
-    node_map_add_string(&root, "error", err);
+    nanum_msg_render(err, err_text, sizeof(err_text));
+    nanum_msg_render(g.cat_err, cat_err_text, sizeof(cat_err_text));
+    node_map_add_string(&root, "error", err_text);
     node_map_add_string(&root, "directory", g.userdir ? g.userdir : "");
     node_map_add_flag(&root, "busy", running);
     node_map_add_flag(&root, "catalog", g.cat_ok);
-    node_map_add_string(&root, "catalog_error", g.cat_err);
+    node_map_add_string(&root, "catalog_error", cat_err_text);
 
     mpv_node *arr = node_map_add(&root, "models", MPV_FORMAT_NODE_ARRAY);
     bool all = true;
@@ -524,7 +526,7 @@ static void publish(struct MPContext *mpctx)
             all &= mi.installed;
         mpv_node *m = node_array_add(arr, MPV_FORMAT_NODE_MAP);
         node_map_add_string(m, "id", KNOWN[i].id);
-        node_map_add_string(m, "label", g.cat[i].valid ? g.cat[i].label : KNOWN[i].label);
+        node_map_add_string(m, "label", nanum_tr(g.cat[i].valid ? g.cat[i].label : KNOWN[i].label));
         node_map_add_string(m, "filename", model_file(i));
         node_map_add_int64(m, "size", g.cat[i].valid ? g.cat[i].size : 0);
         node_map_add_flag(m, "installed", mi.installed);
@@ -574,8 +576,11 @@ void nanum_models_startup(struct MPContext *mpctx, const char *root, void *ctx,
     }
 
     load_catalog();
-    if (!g.cat_ok)
-        mp_warn(g.log, "%s\n", g.cat_err);
+    if (!g.cat_ok) {
+        char en[sizeof(g.cat_err)];
+        nanum_msg_render_lang(g.cat_err, en, sizeof(en), NANUM_UI_EN);
+        mp_warn(g.log, "%s\n", en);
+    }
 
     void *tmp = talloc_new(NULL);
     for (int i = 0; i < M_COUNT; i++) {
@@ -613,32 +618,37 @@ void nanum_models_refresh(struct MPContext *mpctx)
     publish(mpctx);
 }
 
-// Records a rejected request as the (terminal) state, unless a worker runs.
-static bool reject(struct MPContext *mpctx, const char *fmt, ...) MP_PRINTF_ATTRIBUTE(2, 3);
-static bool reject(struct MPContext *mpctx, const char *fmt, ...)
+// Records a rejected request (a stored message, see NANUM_MSG) as the (terminal) state,
+// unless a worker runs.
+static bool reject(struct MPContext *mpctx, const char *stored)
 {
-    char msg[640];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-    MP_ERR(mpctx, "%s\n", msg);
+    char en[640];
+    nanum_msg_render_lang(stored, en, sizeof(en), NANUM_UI_EN);
+    MP_ERR(mpctx, "%s\n", en);
     mp_mutex_lock(&g_lock);
     if (!g.running) {
         g.st = ST_ERROR;
         g.cur = -1;
         g.recv = g.total = 0;
-        snprintf(g.err, sizeof(g.err), "%s", msg);
+        snprintf(g.err, sizeof(g.err), "%s", stored);
     }
     mp_mutex_unlock(&g_lock);
     publish(mpctx);
     return false;
 }
 
+// key: a message without arguments.
+static bool reject_key(struct MPContext *mpctx, const char *key)
+{
+    char stored[640];
+    NANUM_MSG(stored, key);
+    return reject(mpctx, stored);
+}
+
 bool nanum_models_download(struct MPContext *mpctx, enum nanum_model_target target)
 {
     if (!g.init)
-        return reject(mpctx, "The model manager is not initialized.");
+        return reject_key(mpctx, N_("The model manager is not initialized."));
 
     mp_mutex_lock(&g_lock);
     bool down = g.shutting_down, busy = g.running;
@@ -663,7 +673,7 @@ bool nanum_models_download(struct MPContext *mpctx, enum nanum_model_target targ
         [NANUM_MODELS_MULTILINGUAL_LARGE] = {M_VAD, M_MULTI_LARGE, -1, -1},
     };
     if ((unsigned)target >= MP_ARRAY_SIZE(plan))
-        return reject(mpctx, "Unknown model download target.");
+        return reject_key(mpctx, N_("Unknown model download target."));
 
     if (!g.cat_ok)
         load_catalog();
@@ -675,16 +685,17 @@ bool nanum_models_download(struct MPContext *mpctx, enum nanum_model_target targ
         if (!g.cat[i].valid) {
             talloc_free(tmp);
             talloc_free(j);
-            return reject(mpctx, "%s", g.cat_err[0] ? g.cat_err
-                                                    : "The model catalog is unavailable.");
+            if (g.cat_err[0])
+                return reject(mpctx, g.cat_err);
+            return reject_key(mpctx, N_("The model catalog is unavailable."));
         }
         struct minfo mi;
         model_info(tmp, mpctx, i, &mi);
         if (!mi.path[0]) {
             talloc_free(tmp);
             talloc_free(j);
-            return reject(mpctx, "The user model folder cannot be determined "
-                          "(%%LOCALAPPDATA%% is unavailable).");
+            return reject_key(mpctx, N_("The user model folder cannot be determined "
+                              "(%%LOCALAPPDATA%% is unavailable)."));
         }
         struct jmodel *m = &j->m[j->n++];
         m->idx = i;
@@ -696,7 +707,7 @@ bool nanum_models_download(struct MPContext *mpctx, enum nanum_model_target targ
 
     if (!nanum_dl_begin(&g.dl)) {
         talloc_free(j);
-        return reject(mpctx, "Out of memory.");
+        return reject_key(mpctx, N_("Out of memory."));
     }
     mp_mutex_lock(&g_lock);
     g.running = true;
@@ -714,7 +725,7 @@ bool nanum_models_download(struct MPContext *mpctx, enum nanum_model_target targ
         mp_mutex_unlock(&g_lock);
         nanum_dl_end(&g.dl);
         talloc_free(j);
-        return reject(mpctx, "Cannot start the model download thread.");
+        return reject_key(mpctx, N_("Cannot start the model download thread."));
     }
     g.thread_valid = true;
     publish(mpctx);

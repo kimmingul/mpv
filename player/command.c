@@ -88,6 +88,8 @@
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
 #include "osdep/nanum-diag.h"
+#include "osdep/nanum-disc.h"
+#include "nanum/i18n.h"
 
 #include "core.h"
 
@@ -7206,10 +7208,41 @@ static void cmd_nanum_cancel_accelerator_download(void *p)
     nanum_accel_cancel(cmd->mpctx);
 }
 
+// NanumPlayer: interface language (nanum/i18n.c). Applies at once, publishes
+// user-data/nanum/ui-language[-mode|-error] and saves ui-language.conf; fails (with the
+// reason in the error property) when the choice could not be saved.
+static void cmd_nanum_ui_language(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    bool persisted = false;
+    char err[512] = "";
+    cmd->success = nanum_ui_language_command(cmd->mpctx, cmd->args[0].v.s, &persisted,
+                                             err, sizeof(err));
+    if (!cmd->success)
+        MP_ERR(cmd->mpctx, "nanum-ui-language: %s\n", err);
+}
+
 static void cmd_nanum_diagnostics(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
     cmd->success = nanum_diag_command(cmd->mpctx, cmd->args[0].v.i);
+}
+
+// NanumPlayer: native disc listing and lossless MKV remux (osdep/nanum-disc.c).
+// Both run on a command worker thread (like "subprocess") and are abortable;
+// the structured result is in cmd->result and the progress is published as
+// user-data/nanum/rip.
+static void cmd_nanum_disc_list(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_disc_list(cmd, cmd->args[0].v.s);
+}
+
+static void cmd_nanum_disc_rip(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_disc_rip(cmd, cmd->args[0].v.s, cmd->args[1].v.s, cmd->args[2].v.s,
+                   cmd->args[3].v.s);
 }
 
 static void cmd_filter(void *p)
@@ -8130,10 +8163,27 @@ const struct mp_cmd_def mp_cmds[] = {
     { "nanum-accelerator-refresh", cmd_nanum_accelerator_refresh },
     { "nanum-download-accelerator", cmd_nanum_download_accelerator },
     { "nanum-cancel-accelerator-download", cmd_nanum_cancel_accelerator_download },
+    { "nanum-ui-language", cmd_nanum_ui_language,
+        { {"language", OPT_STRING(v.s)} } },
     { "nanum-diagnostics", cmd_nanum_diagnostics,
         { {"mode", OPT_CHOICE(v.i, {"toggle", NANUM_DIAG_TOGGLE}, {"on", NANUM_DIAG_ON},
                               {"off", NANUM_DIAG_OFF}),
            OPTDEF_INT(NANUM_DIAG_TOGGLE), .flags = MP_CMD_OPT_ARG} } },
+    { "nanum-disc-list", cmd_nanum_disc_list,
+        { {"device", OPT_STRING(v.s), OPTDEF_STR(""), .flags = MP_CMD_OPT_ARG} },
+        .spawn_thread = true,
+        .can_abort = true,
+    },
+    { "nanum-disc-rip", cmd_nanum_disc_rip,
+        {
+            {"device", OPT_STRING(v.s)},
+            {"title", OPT_STRING(v.s)},
+            {"destination", OPT_STRING(v.s)},
+            {"expected_disc_id", OPT_STRING(v.s), OPTDEF_STR(""), .flags = MP_CMD_OPT_ARG},
+        },
+        .spawn_thread = true,
+        .can_abort = true,
+    },
 
     { "script-binding", cmd_script_binding,
         {

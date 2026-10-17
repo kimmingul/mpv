@@ -1,22 +1,16 @@
 /*
- * NanumPlayer: bounded normal / diagnostic logging (Windows).
+ * NanumPlayer: explicit disc diagnostics (Windows).
  *
- * Normal mode: the application log (%APPDATA%\NanumPlayer\last-playback.log)
- * holds info/warning/error messages only and is bounded (previous sessions are
- * kept as last-playback.1.log, .2.log; a running log rotates at 8 MiB). Disc
- * I/O contributes only failures and unusually slow reads/seeks, each with the
- * Win32 error code captured at the failing ReadFile (see stream/bluray_file_win32.c).
- *
- * Diagnostic mode (explicit, per session): the same events are also written,
- * with timestamps, together with every seek request/result, the first reads
- * after each reposition, periodic read statistics, the environment (libbluray,
- * AACS/BD+ library versions and paths, drive model/firmware) and, after a read
- * failure, the Windows System event log entries of the storage stack and a
- * filtered tail of the MakeMKV (libmmbd) debug log, to a separate file
+ * Nothing is logged by default: the player has no application log (see
+ * nanum-private.h). Diagnostic mode (explicit, per session; only disc I/O is
+ * recorded, never a web address, cookie or header) writes timestamps, every seek
+ * request/result, the first reads after each reposition, periodic read
+ * statistics, the environment (libbluray, AACS/BD+ library versions and paths,
+ * drive model/firmware) and, after a read failure, the Windows System event log
+ * entries of the storage stack, to a file
  *     %APPDATA%\NanumPlayer\diagnostics\disc-<date>-<time>-<pid>.log
- * of at most 8 MiB, the newest 8 of which are kept. The application log
- * additionally receives the disc modules' debug messages. Video payload,
- * keys and authentication data are never written.
+ * of at most 8 MiB, the newest 8 of which are kept. Video payload, keys and
+ * authentication data are never written.
  *
  * Exposed to scripts as the command
  *     nanum-diagnostics [toggle|on|off]
@@ -24,7 +18,6 @@
  *     enabled        bool    diagnostic mode is on
  *     file           string  diagnostic log of this session ("" until first enabled)
  *     directory      string  folder of the diagnostic logs
- *     normal_log     string  the application log
  *     max_bytes      int     size limit of one diagnostic log
  *     keep           int     diagnostic logs kept
  *     slow_read_ms   int     reads slower than this are recorded
@@ -61,9 +54,9 @@ enum nanum_diag_mode {
 #ifdef _WIN32
 
 // Called once by nanum_startup_defaults() with the settings directory (UTF-8,
-// may be NULL) and the path of the application log: installs the log bounds.
-void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir,
-                        const char *app_log);
+// may be NULL): where the diagnostic logs go if they are switched on. Starts
+// the session with diagnostics on if NANUMPLAYER_DIAGNOSTICS is set.
+void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir);
 
 // Publishes user-data/nanum/diagnostics (core thread).
 void nanum_diag_publish(struct MPContext *mpctx);
@@ -80,9 +73,7 @@ bool nanum_diag_enabled(void);
 // the soft limit). Any thread. The line is cut at 1000 bytes; no newline needed.
 void nanum_diag_log(bool important, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
-// The libbluray debug stream passes through here: remembers the path of the
-// MakeMKV debug log libmmbd announces, and mirrors the line into the
-// diagnostic log. Any thread.
+// Mirrors libbluray disc I/O messages into the diagnostic log. Any thread.
 void nanum_diag_libbluray_message(const char *msg);
 
 // Session start of a Blu-ray stream (after bd_open succeeded): one concise
@@ -92,7 +83,7 @@ void nanum_diag_describe_bluray(struct mp_log *log, const char *device,
 
 // A disc read failed: if diagnostics are on, collect (at most every 30 s, on a
 // short-lived thread) the System event log entries of the storage stack from
-// the last two minutes and the MakeMKV log tail into the diagnostic log.
+// the last two minutes into the diagnostic log.
 void nanum_diag_collect_failure_context(void);
 
 // Windows error code -> short UTF-8 text without trailing newline.
@@ -103,8 +94,7 @@ void nanum_diag_wall_clock(char *out, size_t size);
 
 #else
 
-static inline void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir,
-                                      const char *app_log) {}
+static inline void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir) {}
 static inline void nanum_diag_publish(struct MPContext *mpctx) {}
 static inline bool nanum_diag_command(struct MPContext *mpctx, enum nanum_diag_mode mode)
 {

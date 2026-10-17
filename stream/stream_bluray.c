@@ -21,9 +21,6 @@
  * Blu-ray parser/reader using libbluray
  *  Use 'git clone git://git.videolan.org/libbluray' to get it.
  *
- * TODO:
- *  - Add descrambled keys database support (KEYDB.cfg)
- *
  */
 
 #include <string.h>
@@ -53,6 +50,9 @@
 #include "osdep/nanum-diag.h"
 #include "osdep/timer.h"
 #include "stream/bluray_file_win32.h"
+#if defined(_WIN32) && !HAVE_UWP
+#include "osdep/nanum-disc-keys.h"
+#endif
 #include "sub/osd.h"
 #include "sub/img_convert.h"
 #include "video/csputils.h"
@@ -1405,8 +1405,8 @@ static int bluray_stream_open_internal(stream_t *s)
     uint32_t mask = 0;
     if (mp_msg_test(s->log, MSGL_DEBUG))
         mask |= DBG_CRIT | DBG_BLURAY | DBG_HDMV;
-    // Diagnostics need libbluray's error/state messages (and libmmbd's
-    // announcement of its debug log) even without a debug-level log.
+    // Diagnostics need libbluray's error/state messages even without a
+    // debug-level log.
     if (nanum_diag_enabled())
         mask |= DBG_CRIT | DBG_BLURAY;
     // When all bits are set (-1) libbluray inits to DBG_CRIT, set all bits,
@@ -1425,7 +1425,11 @@ static int bluray_stream_open_internal(stream_t *s)
     // bluray_file_win32.h; the device path, and with it AACS/BD+, is unchanged.
     b->io = bd_io_begin(s->log);
     char *device_tmp = mp_get_user_path(NULL, s->global, device);
+#if defined(_WIN32) && !HAVE_UWP
+    BLURAY *bd = nanum_disc_bd_open(device_tmp, s->log, s->cancel);
+#else
     BLURAY *bd = bd_open(device_tmp, NULL);
+#endif
     if (bd || !b->probing) {
         int major = 0, minor = 0, micro = 0;
         bd_get_version(&major, &minor, &micro);

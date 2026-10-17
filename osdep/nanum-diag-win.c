@@ -37,18 +37,10 @@
 #define DIAG_LOG_MAX_BYTES   (8 * 1024 * 1024)
 #define DIAG_LOG_SOFT_BYTES  (6 * 1024 * 1024)   // above: only important lines
 #define DIAG_LOG_KEEP        8
-#define APP_LOG_MAX_BYTES    (8 * 1024 * 1024)
-#define APP_LOG_KEEP         2
 #define LINE_MAX_BYTES       1000
 #define COLLECT_INTERVAL_MS  30000
 #define EVENT_WINDOW_MS      120000
 #define DIAG_EVENT_LIMIT     8
-#define MAKEMKV_TAIL_BYTES   (32 * 1024)
-#define MAKEMKV_MAX_LINES    24
-
-// Disc modules that are also written to the application log down to debug
-// while diagnostics are on.
-#define DIAG_APP_LOG_MODULES "bd,bdmv,disc,stream"
 
 static mp_static_mutex g_lock = MP_STATIC_MUTEX_INITIALIZER;
 static atomic_bool g_enabled;
@@ -57,13 +49,11 @@ static struct {
     struct mpv_global *global;
     struct mp_log *log;
     char *dir;              // diagnostic log folder, NULL if unknown
-    char *app_log;
     char *file;             // diagnostic log of this session, NULL until created
     HANDLE h;               // INVALID_HANDLE_VALUE while closed
     int64_t bytes;
     bool capped;
     int64_t dropped;
-    char *makemkv_log;      // path announced by libmmbd, UTF-8
     ULONGLONG last_collect; // GetTickCount64() of the last collection
     bool collecting;
 } g = {.h = INVALID_HANDLE_VALUE};
@@ -332,14 +322,13 @@ static bool open_log_locked(struct mp_log *log)
     char head[MAX_PATH * 4 + 256];
     int n = snprintf(head, sizeof(head),
         "NanumPlayer diagnostic log (disc I/O). Local time %s = player clock %.3f s.\n"
-        "Lines: <local time> [<player clock, same as the application log>] [T<thread>] text.\n"
+        "Lines: <local time> [<player clock>] [T<thread>] text.\n"
         "Application: %s (pid %lu)\n"
-        "Application log: %s\n"
         "Read errors carry the Win32 error captured by the failing ReadFile; the drive's\n"
-        "own sense data is not exposed by Win32 file I/O (see the event log / MakeMKV\n"
-        "lines collected after a failure). Size limit %d MiB; the newest %d logs are kept.\n\n",
+        "own sense data is not exposed by Win32 file I/O (see the Windows events\n"
+        "collected after a failure). Size limit %d MiB; the newest %d logs are kept.\n\n",
         wall, mp_time_sec(), exe, (unsigned long)GetCurrentProcessId(),
-        g.app_log ? g.app_log : "?", DIAG_LOG_MAX_BYTES / (1024 * 1024),
+        DIAG_LOG_MAX_BYTES / (1024 * 1024),
         DIAG_LOG_KEEP);
     if (n > 0)
         write_raw_locked(head, (size_t)MPMIN((size_t)n, sizeof(head) - 1));
@@ -363,7 +352,6 @@ static bool apply_mode(struct MPContext *mpctx, enum nanum_diag_mode mode, bool 
             if (!ok)
                 return false;
             atomic_store(&g_enabled, true);
-            mp_msg_set_log_diagnostics(mpctx->global, true);
             nanum_diag_log(true, "diagnostics ON");
             mp_msg(mpctx->log, MSGL_INFO,
                    "Diagnostics on: disc I/O details go to %s\n", file);
@@ -375,7 +363,6 @@ static bool apply_mode(struct MPContext *mpctx, enum nanum_diag_mode mode, bool 
             nanum_diag_log(true, "diagnostics OFF, %" PRId64
                            " lines were dropped by the size limit", dropped);
             atomic_store(&g_enabled, false);
-            mp_msg_set_log_diagnostics(mpctx->global, false);
             mp_msg(mpctx->log, MSGL_INFO, "Diagnostics off.\n");
         }
     }
@@ -384,24 +371,14 @@ static bool apply_mode(struct MPContext *mpctx, enum nanum_diag_mode mode, bool 
     return true;
 }
 
-void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir,
-                        const char *app_log)
+void nanum_diag_startup(struct MPContext *mpctx, const char *settings_dir)
 {
     mp_mutex_lock(&g_lock);
     g.global = mpctx->global;
     g.log = mpctx->log;
     talloc_free(g.dir);
     g.dir = settings_dir ? talloc_asprintf(NULL, "%s\\diagnostics", settings_dir) : NULL;
-    talloc_free(g.app_log);
-    g.app_log = app_log ? talloc_strdup(NULL, app_log) : NULL;
     mp_mutex_unlock(&g_lock);
-
-    // The application's own log: info and above, bounded. A --log-file chosen
-    // by the user is not touched.
-    if (app_log) {
-        mp_msg_set_log_policy(mpctx->global, app_log, MSGL_INFO, DIAG_APP_LOG_MODULES,
-                              APP_LOG_MAX_BYTES, APP_LOG_KEEP);
-    }
 
     const char *env = getenv("NANUMPLAYER_DIAGNOSTICS");
     if (env && env[0] && strcmp(env, "0"))
@@ -418,7 +395,6 @@ void nanum_diag_publish(struct MPContext *mpctx)
     mp_mutex_lock(&g_lock);
     char *file = talloc_strdup(NULL, g.file ? g.file : "");
     char *dir = talloc_strdup(NULL, g.dir ? g.dir : "");
-    char *app = talloc_strdup(NULL, g.app_log ? g.app_log : "");
     mp_mutex_unlock(&g_lock);
 
     mpv_node root;
@@ -426,7 +402,6 @@ void nanum_diag_publish(struct MPContext *mpctx)
     node_map_add_flag(&root, "enabled", nanum_diag_enabled());
     node_map_add_string(&root, "file", file);
     node_map_add_string(&root, "directory", dir);
-    node_map_add_string(&root, "normal_log", app);
     node_map_add_int64(&root, "max_bytes", DIAG_LOG_MAX_BYTES);
     node_map_add_int64(&root, "keep", DIAG_LOG_KEEP);
     node_map_add_int64(&root, "slow_read_ms", nanum_diag_enabled()
@@ -437,7 +412,6 @@ void nanum_diag_publish(struct MPContext *mpctx)
     talloc_free(root.u.list);
     talloc_free(file);
     talloc_free(dir);
-    talloc_free(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,17 +421,6 @@ void nanum_diag_publish(struct MPContext *mpctx)
 // libbluray's debug stream, see stream_bluray.c.
 void nanum_diag_libbluray_message(const char *msg)
 {
-    static const char marker[] = "log will be saved as file://";
-    const char *p = strstr(msg, marker);
-    if (p) {
-        p += sizeof(marker) - 1;
-        size_t len = strcspn(p, "\r\n");
-        char *path = talloc_strndup(NULL, p, len);
-        mp_mutex_lock(&g_lock);
-        talloc_free(g.makemkv_log);
-        g.makemkv_log = path;
-        mp_mutex_unlock(&g_lock);
-    }
     // The HDMV/BD-J virtual machine traces are not disc I/O.
     if (nanum_diag_enabled() && !strstr(msg, "/hdmv/") && !strstr(msg, "/bdj/"))
         nanum_diag_log(false, "libbluray: %s", msg);
@@ -466,7 +429,7 @@ void nanum_diag_libbluray_message(const char *msg)
 static bool is_wanted_module(const wchar_t *name)
 {
     static const wchar_t *const prefix[] = {
-        L"libbluray", L"libaacs", L"libmmbd", L"libbdplus", L"libudfread",
+        L"libbluray", L"libaacs", L"libbdplus", L"libudfread", L"libdvd",
     };
     for (size_t i = 0; i < MP_ARRAY_SIZE(prefix); i++) {
         if (!_wcsnicmp(name, prefix[i], wcslen(prefix[i])))
@@ -604,16 +567,12 @@ void nanum_diag_describe_bluray(struct mp_log *log, const char *device,
             const char *v = getenv(vars[i]);
             nanum_diag_log(true, "env: %s=%s", vars[i], v ? v : "(not set)");
         }
-        mp_mutex_lock(&g_lock);
-        char *mm = g.makemkv_log ? talloc_strdup(tmp, g.makemkv_log) : NULL;
-        mp_mutex_unlock(&g_lock);
-        nanum_diag_log(true, "env: MakeMKV (libmmbd) debug log=%s", mm ? mm : "(not announced)");
     }
     talloc_free(tmp);
 }
 
 // ---------------------------------------------------------------------------
-// Failure context: System event log + MakeMKV log tail
+// Failure context: Windows System event log
 // ---------------------------------------------------------------------------
 
 static bool xml_text(const char *xml, const char *open_tag, char *out, size_t size)
@@ -741,131 +700,10 @@ static void collect_event_log(void)
     FreeLibrary(m);
 }
 
-static bool has_long_hex(const char *s, int run)
-{
-    int n = 0;
-    for (; *s; s++) {
-        n = isxdigit((unsigned char)*s) ? n + 1 : 0;
-        if (n >= run)
-            return true;
-    }
-    return false;
-}
-
-static bool contains_ci(const char *s, const char *needle)
-{
-    size_t nl = strlen(needle);
-    for (; *s; s++) {
-        if (!_strnicmp(s, needle, nl))
-            return true;
-    }
-    return false;
-}
-
-// Only drive/I-O error context leaves the MakeMKV log: anything that can carry
-// keys, certificates or authentication data, and any long hex dump, is dropped.
-static bool makemkv_line_ok(const char *line)
-{
-    static const char *const deny[] = {
-        "key", "vuk", "cert", "nonce", "secret", "password", "auth", "pmsn",
-        "mkb", "binding", "token", "serial", "challenge", "signature",
-    };
-    for (size_t i = 0; i < MP_ARRAY_SIZE(deny); i++) {
-        if (contains_ci(line, deny[i]))
-            return false;
-    }
-    if (has_long_hex(line, 16))
-        return false;
-    static const char *const allow[] = {
-        "scsi", "sense", "error", "fail", "retry", "timeout", "sector", "i/o",
-        "medium", "read", "drive",
-    };
-    for (size_t i = 0; i < MP_ARRAY_SIZE(allow); i++) {
-        if (contains_ci(line, allow[i]))
-            return true;
-    }
-    return false;
-}
-
-static void collect_makemkv_tail(void)
-{
-    mp_mutex_lock(&g_lock);
-    char *path = g.makemkv_log ? talloc_strdup(NULL, g.makemkv_log) : NULL;
-    mp_mutex_unlock(&g_lock);
-    if (!path) {
-        nanum_diag_log(true, "makemkv-log: libmmbd announced no debug log (not in use, or logging off)");
-        return;
-    }
-    wchar_t *wpath = mp_from_utf8(NULL, path);
-    HANDLE h = CreateFileW(wpath, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    DWORD err = GetLastError();
-    talloc_free(wpath);
-    if (h == INVALID_HANDLE_VALUE) {
-        char text[200];
-        nanum_diag_os_error_text(err, text, sizeof(text));
-        nanum_diag_log(true, "makemkv-log: cannot open %s: %s (%lu)", path, text,
-                       (unsigned long)err);
-        talloc_free(path);
-        return;
-    }
-    LARGE_INTEGER size;
-    char *buf = malloc(MAKEMKV_TAIL_BYTES + 1);
-    DWORD got = 0;
-    if (buf && GetFileSizeEx(h, &size)) {
-        LARGE_INTEGER off = {.QuadPart = size.QuadPart > MAKEMKV_TAIL_BYTES
-                                         ? size.QuadPart - MAKEMKV_TAIL_BYTES : 0};
-        if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
-            ReadFile(h, buf, MAKEMKV_TAIL_BYTES, &got, NULL);
-    }
-    CloseHandle(h);
-    if (!buf || !got) {
-        nanum_diag_log(true, "makemkv-log: %s is empty or unreadable", path);
-        free(buf);
-        talloc_free(path);
-        return;
-    }
-    buf[got] = 0;
-
-    // Newest lines last; keep the last MAKEMKV_MAX_LINES that pass the filter.
-    char *lines[MAKEMKV_MAX_LINES];
-    int count = 0, first = 0;
-    for (char *s = buf; *s;) {
-        char *e = s + strcspn(s, "\r\n");
-        char saved = *e;
-        *e = 0;
-        if (e != s && makemkv_line_ok(s)) {
-            lines[(first + count) % MAKEMKV_MAX_LINES] = s;
-            if (count < MAKEMKV_MAX_LINES)
-                count++;
-            else
-                first = (first + 1) % MAKEMKV_MAX_LINES;
-        }
-        if (!saved)
-            break;
-        s = e + 1;
-    }
-    nanum_diag_log(true, "makemkv-log: %s, %d filtered lines of the last %lu bytes "
-                   "(key/certificate/authentication lines and hex dumps are never copied)",
-                   path, count, (unsigned long)got);
-    for (int i = 0; i < count; i++) {
-        char *l = lines[(first + i) % MAKEMKV_MAX_LINES];
-        for (char *c = l; *c; c++) {
-            if ((unsigned char)*c < 0x20)
-                *c = ' ';
-        }
-        nanum_diag_log(true, "makemkv-log> %.220s", l);
-    }
-    free(buf);
-    talloc_free(path);
-}
-
 static unsigned __stdcall collect_thread(void *arg)
 {
-    nanum_diag_log(true, "failure context: collecting event log and MakeMKV log tail");
+    nanum_diag_log(true, "failure context: collecting Windows storage events");
     collect_event_log();
-    collect_makemkv_tail();
     mp_mutex_lock(&g_lock);
     g.collecting = false;
     mp_mutex_unlock(&g_lock);

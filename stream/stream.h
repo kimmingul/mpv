@@ -102,6 +102,7 @@ enum stream_ctrl {
     STREAM_CTRL_NAV_DRAIN_ENABLE,    // start holding EOF at jump boundaries
     STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
     STREAM_CTRL_GET_DISC_IDENTITY,   // char** (talloc'd): disc/title identity text, NanumPlayer library
+    STREAM_CTRL_NAV_STOP_AT_TITLE_END, // DVD: int* title (1-based); EOF when the VM leaves it
 };
 
 // Fetch the still image that a disc (DVD-Audio ASVS) associates with the given

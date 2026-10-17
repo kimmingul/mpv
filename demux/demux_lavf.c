@@ -1421,6 +1421,9 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     if (demuxer->opts->index_mode != 1)
         avfc->flags |= AVFMT_FLAG_IGNIDX;
 
+    if (demuxer->params && demuxer->params->genpts)
+        avfc->flags |= AVFMT_FLAG_GENPTS;
+
     if (lavfdopts->probesize) {
         if (av_opt_set_int(avfc, "probesize", lavfdopts->probesize, 0) < 0)
             MP_ERR(demuxer, "couldn't set option probesize to %"PRId64"\n",

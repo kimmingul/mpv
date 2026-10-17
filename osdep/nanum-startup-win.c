@@ -26,12 +26,14 @@
 #include "osdep/io.h"
 #include "osdep/nanum-startup.h"
 #include "osdep/nanum-version.h"
+#include "osdep/nanum-private.h"
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
 #include "osdep/nanum-diag.h"
 #include "player/command.h"
 #include "player/core.h"
+#include "nanum/i18n.h"
 
 // Written to the config dir on first run only. Never touched afterwards.
 static const char DEFAULT_CONF[] =
@@ -44,12 +46,6 @@ static const char DEFAULT_CONF[] =
     "# nanum-translate-model=gemma4:latest\n"
     "# nanum-target-language=Korean\n"
     "# Blu-ray: set the drive, e.g.  bluray-device=E:\n";
-
-static bool is_file(const wchar_t *path)
-{
-    DWORD attr = GetFileAttributesW(path);
-    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
-}
 
 static wchar_t *wjoin(void *ctx, const wchar_t *a, const wchar_t *b)
 {
@@ -105,69 +101,15 @@ static wchar_t *app_root(void *ctx)
 void nanum_startup_environment(void)
 {
     void *tmp = talloc_new(NULL);
-    wchar_t *exe = exe_dir(tmp);
     wchar_t *root = app_root(tmp);
-
-    // libbluray's Windows dl_dlopen appends ".dll" even to absolute paths, so
-    // LIB*_PATH values are written without extension. They are read with the C
-    // runtime's getenv(), which does not see SetEnvironmentVariableW() changes
-    // made after startup (the old launcher set them for a child process):
-    // _wputenv_s() updates both.
-    static const struct {
-        const wchar_t *variable;
-        const wchar_t *name;
-    } libs[] = {
-        {L"LIBAACS_PATH", L"libaacs"},
-        {L"LIBBDPLUS_PATH", L"libbdplus"},
-    };
-
-    // The user's MakeMKV (libmmbd is API compatible with libaacs/libbdplus),
-    // used in place only, never copied.
-    wchar_t *mmbd = NULL;
-    static const wchar_t *const folders[] =
-        {L"ProgramW6432", L"ProgramFiles", L"ProgramFiles(x86)"};
-    for (size_t i = 0; i < MP_ARRAY_SIZE(folders) && !mmbd; i++) {
-        DWORD n = GetEnvironmentVariableW(folders[i], NULL, 0);
-        if (n <= 1)
-            continue;
-        wchar_t *dir = talloc_array(tmp, wchar_t, n);
-        if (GetEnvironmentVariableW(folders[i], dir, n) != n - 1)
-            continue;
-        wchar_t *make = wjoin(tmp, dir, L"MakeMKV");
-        wchar_t *file = wjoin(tmp, make, L"libmmbd64.dll");
-        if (is_file(file)) {
-            file[wcslen(file) - 4] = 0;
-            mmbd = file;
-        }
+    if (root) {
+        // libbluray appends ".dll". Pin both loaders to our independent
+        // libraries; old renamed libmmbd copies and installation discovery
+        // must never reintroduce a console-process dependency.
+        wchar_t *dir = wjoin(tmp, root, L"disc");
+        _wputenv_s(L"LIBAACS_PATH", wjoin(tmp, dir, L"libaacs"));
+        _wputenv_s(L"LIBBDPLUS_PATH", wjoin(tmp, dir, L"libbdplus"));
     }
-
-    for (size_t i = 0; i < MP_ARRAY_SIZE(libs); i++) {
-        // 1. An explicit override always wins.
-        if (GetEnvironmentVariableW(libs[i].variable, NULL, 0))
-            continue;
-
-        wchar_t file[64];
-        swprintf(file, MP_ARRAY_SIZE(file), L"%ls.dll", libs[i].name);
-
-        // 2. A library next to the executable: the loader finds it.
-        if (exe && is_file(wjoin(tmp, exe, file)))
-            continue;
-        if (root) {
-            // 3. Legacy layout (<root>\bin\libaacs.dll, kept by the installer
-            //    from versions before 1.1): point libbluray at it.
-            wchar_t *legacy = wjoin(tmp, root, L"bin");
-            legacy = wjoin(tmp, legacy, file);
-            if (is_file(legacy)) {
-                legacy[wcslen(legacy) - 4] = 0;
-                _wputenv_s(libs[i].variable, legacy);
-                continue;
-            }
-        }
-        // 4. MakeMKV.
-        if (mmbd)
-            _wputenv_s(libs[i].variable, mmbd);
-    }
-
     talloc_free(tmp);
 }
 
@@ -179,18 +121,10 @@ static void add_opt(char **text, const char *name, const char *value)
                                    (int)strlen(value), value);
 }
 
-static void add_path_opt(char **text, const char *name, const char *dir,
-                         const char *file)
-{
-    char *value = talloc_asprintf(*text, "%s\\%s", dir, file);
-    add_opt(text, name, value);
-    talloc_free(value);
-}
-
 // The directory of the user's settings. Normally the config dir resolved by
 // mpv (%APPDATA%\NanumPlayer, --config-dir, portable_config); with --no-config
-// it is still %APPDATA%\NanumPlayer, so the log and translation cache keep one
-// stable location.
+// it is still %APPDATA%\NanumPlayer, so the diagnostics folder keeps one stable
+// location.
 static char *settings_dir(void *ctx, struct mpv_global *global, bool *configured)
 {
     char *dir = mp_find_user_file(ctx, global, "home", "");
@@ -282,16 +216,19 @@ void nanum_startup_defaults(struct MPContext *mpctx)
         char *opt = talloc_asprintf(tmp, "ytdl_hook-ytdl_path=%s;yt-dlp", ytdlp);
         add_opt(&text, "script-opts-append", opt);
     }
-    char *app_log = NULL;
-    if (settings) {
-        add_path_opt(&text, "nanum-cache", settings, "tr_cache.jsonl");
-        add_path_opt(&text, "log-file", settings, "last-playback.log");
-        app_log = talloc_asprintf(tmp, "%s\\last-playback.log", settings);
-    }
-    // The application log is bounded (info and above, previous sessions kept,
-    // size limit) and diagnostic mode is set up; both apply to this default
-    // log file only, a --log-file of the user is left as it was.
-    nanum_diag_startup(mpctx, settings, app_log);
+    // Nothing about what is played is kept (see osdep/nanum-private.h): no
+    // application log, no translation cache, no subtitle library, no resume or
+    // watch history, no disk shader/ICC cache, and yt-dlp keeps no cache folder.
+    // They are all still available when asked for explicitly (--log-file,
+    // --nanum-cache, --nanum-library-db, --save-position-on-quit, ...).
+    add_opt(&text, "resume-playback", "no");
+    add_opt(&text, "save-position-on-quit", "no");
+    add_opt(&text, "save-watch-history", "no");
+    add_opt(&text, "gpu-shader-cache", "no");
+    add_opt(&text, "icc-cache", "no");
+    add_opt(&text, "ytdl-raw-options-append", "no-cache-dir=");
+    // The disc diagnostics (explicit, see nanum-diag.h) are the only log written.
+    nanum_diag_startup(mpctx, settings);
 
     // Same level as mpv's built-in profile defaults: below mpv.conf and the
     // command line.
@@ -317,9 +254,60 @@ static bool script_given(struct MPContext *mpctx, const char *name)
     return false;
 }
 
+// The string value of an option ("" if unset).
+static char *option_string(struct MPContext *mpctx, void *ctx, const char *name)
+{
+    char *prop = talloc_asprintf(ctx, "options/%s", name);
+    char *val = NULL;
+    char *res = talloc_strdup(ctx, "");
+    if (mp_property_do(prop, M_PROPERTY_GET_STRING, &val, mpctx) > 0 && val) {
+        talloc_free(res);
+        res = talloc_strdup(ctx, val);
+    }
+    talloc_free(val);
+    talloc_free(prop);
+    return res;
+}
+
+// Nothing about what is played is kept (see nanum-private.h). Runs after the
+// config files and command line are known: removes what earlier versions kept by
+// default (unless the user chose a place for it), sweeps the transient folders of
+// killed sessions and publishes user-data/nanum/privacy for the scripts.
+static void nanum_privacy_startup(struct MPContext *mpctx, void *tmp)
+{
+    bool configured = false;
+    char *settings = settings_dir(tmp, mpctx->global, &configured);
+    bool library = option_string(mpctx, tmp, "nanum-library-db")[0];
+    bool cache = option_string(mpctx, tmp, "nanum-cache")[0];
+    bool full = option_string(mpctx, tmp, "nanum-full-dir")[0];
+    bool log = option_string(mpctx, tmp, "log-file")[0];
+    char dumps[4];
+    bool dump = GetEnvironmentVariableA("NANUMPLAYER_CRASH_DUMP_DIR", dumps, sizeof(dumps)) > 0;
+
+    nanum_private_sweep();
+    nanum_private_purge_legacy(settings, library, full, cache, log);
+
+    mpv_node root;
+    node_init(&root, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_flag(&root, "library", library);
+    node_map_add_flag(&root, "translation_cache", cache);
+    node_map_add_string(&root, "result_dir", full ? "custom" : "session");
+    node_map_add_flag(&root, "crash_dumps", dump);
+    node_map_add_flag(&root, "app_log", log);
+    mp_property_do("user-data/nanum/privacy", M_PROPERTY_SET_NODE, &root, mpctx);
+    talloc_free(root.u.list);
+}
+
 void nanum_startup_scripts(struct MPContext *mpctx)
 {
     void *tmp = talloc_new(NULL);
+    // The interface language is known before any script (or native dialog) runs:
+    // --nanum-ui-language, else ui-language.conf in the settings directory, else the
+    // Windows display language.
+    bool configured = false;
+    char *settings = settings_dir(tmp, mpctx->global, &configured);
+    nanum_ui_language_startup(mpctx, settings, option_string(mpctx, tmp, "nanum-ui-language"));
+    nanum_privacy_startup(mpctx, tmp);
     // Scripts find user-data/nanum/app-version and user-data/nanum/models already filled
     // when they load.
     mpv_node version = {.format = MPV_FORMAT_STRING, .u.string = (char *)NANUM_VERSION};

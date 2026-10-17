@@ -34,6 +34,7 @@
 #include <winhttp.h>
 
 #include "mpv/client.h"
+#include "nanum/i18n.h"
 #include "osdep/threads.h"
 
 #define NANUM_DL_MAX_URL 1024
@@ -109,6 +110,22 @@ enum nanum_dl_res nanum_dl_fetch(struct nanum_dl *dl, const struct nanum_dl_item
 enum nanum_dl_res nanum_dl_get_text(struct nanum_dl *dl, const char *url, int64_t max,
                                     void *ctx, char **out);
 
+// Receives the body of nanum_dl_stream_unpinned in order, in chunks of at most
+// NANUM_DL_IO_BUF bytes. false aborts the transfer (the sink records its
+// message with nanum_dl_fail; without one a generic message is set).
+typedef bool (*nanum_dl_sink_fn)(void *user, const void *data, size_t size);
+
+// HTTPS GET of dynamic data that has NO pinned size or digest (for example a
+// public key database that changes every day). Same TLS/redirect/timeout/cancel
+// policy as fetch, but because nothing authenticates the content the caller
+// MUST validate it itself; the body is bounded by `max` bytes (a larger
+// Content-Length or body fails) and handed to `sink` without being kept in
+// memory. Pinned assets MUST keep using nanum_dl_fetch. *received (optional)
+// gets the body size on NANUM_DL_OK. Needs a running job (nanum_dl_begin).
+enum nanum_dl_res nanum_dl_stream_unpinned(struct nanum_dl *dl, const char *url, int64_t max,
+                                           nanum_dl_sink_fn sink, void *sink_user,
+                                           int64_t *received);
+
 // Moves the verified `part` to `final_path`. An existing file there is replaced
 // only if it is not the verified item (a valid file that another process
 // installed meanwhile is kept). `seen` is what the caller saw at `final_path`
@@ -136,8 +153,9 @@ bool nanum_dl_node_int(mpv_node *map, const char *key, int64_t *out);
 
 // Validates one catalog entry (filename, sha256, https url, size) into *out.
 // false (message in err): the entry is unusable.
-bool nanum_dl_parse_item(mpv_node *entry, const char *fallback_label,
-                         struct nanum_dl_item *out, char *err, size_t errsz);
+// Bundled entries must have no URL; other entries require HTTPS.
+bool nanum_dl_parse_item(mpv_node *entry, const char *fallback_label, bool bundled,
+                            struct nanum_dl_item *out, char *err, size_t errsz);
 
 #endif
 

@@ -384,6 +384,7 @@ typedef struct MPOpts {
     struct demux_playlist_opts *demux_playlist;
     struct demux_lavf_opts *demux_lavf;
     struct nanum_opts *nanum;
+    struct nanum_i18n_opts *nanum_i18n;
     struct demux_mkv_opts *demux_mkv;
 #if HAVE_SUBRANDR
     struct demux_sbr_opts *demux_sbr;

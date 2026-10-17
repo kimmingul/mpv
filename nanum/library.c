@@ -21,6 +21,7 @@
 #include "misc/path_utils.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
+#include "nanum/i18n.h"
 #include "nanum/library.h"
 
 #ifdef _WIN32
@@ -156,7 +157,7 @@ bool lib_fingerprint_file(const char *path, char out_hex[65], int64_t *size,
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        snprintf(err, errsz, "cannot open the media file");
+        snprintf(err, errsz, nanum_tr("cannot open the media file"));
         return false;
     }
     bool ok = !fseeko(f, 0, SEEK_END);
@@ -177,7 +178,7 @@ bool lib_fingerprint_file(const char *path, char out_hex[65], int64_t *size,
     }
     fclose(f);
     if (!ok) {
-        snprintf(err, errsz, "cannot read the media file");
+        snprintf(err, errsz, nanum_tr("cannot read the media file"));
         return false;
     }
     sha256_hex(&s, out_hex);
@@ -261,14 +262,14 @@ const char *lib_error(struct nanum_lib *l)
 
 static void set_err(struct nanum_lib *l, const char *what)
 {
-    snprintf(l->err, sizeof(l->err), "%s: %s", what, l->db ? sqlite3_errmsg(l->db) : "?");
+    snprintf(l->err, sizeof(l->err), "%s: %s", nanum_tr(what), l->db ? sqlite3_errmsg(l->db) : "?");
 }
 
 static sqlite3_stmt *Q(struct nanum_lib *l, int id)
 {
     if (!l->stmt[id] &&
         sqlite3_prepare_v2(l->db, sql_text[id], -1, &l->stmt[id], NULL) != SQLITE_OK) {
-        set_err(l, "prepare");
+        set_err(l, N_("prepare"));
         l->stmt[id] = NULL;
         return NULL;
     }
@@ -367,18 +368,6 @@ static void reap_jobs(struct nanum_lib *l)
     }
 }
 
-static char *default_path(void *ctx)
-{
-    const char *base = getenv("LOCALAPPDATA");
-    char *p = talloc_asprintf(ctx, "%s/NanumPlayer/library.sqlite",
-                              base && base[0] ? base : ".");
-    for (char *s = p; *s; s++) {
-        if (*s == '\\')
-            *s = '/';
-    }
-    return p;
-}
-
 static void lib_destroy(void *p)
 {
     struct nanum_lib *l = p;
@@ -394,7 +383,12 @@ static void lib_destroy(void *p)
 struct nanum_lib *lib_open(const char *path, char *err, size_t errsz)
 {
     void *tmp = talloc_new(NULL);
-    char *file = path && path[0] ? talloc_strdup(tmp, path) : default_path(tmp);
+    if (!path || !path[0]) {
+        snprintf(err, errsz, nanum_tr("no library file given"));
+        talloc_free(tmp);
+        return NULL;
+    }
+    char *file = talloc_strdup(tmp, path);
     char *dir = talloc_strdup(tmp, file);
     char *slash = strrchr(dir, '/');
     char *bslash = strrchr(dir, '\\');
@@ -412,7 +406,7 @@ struct nanum_lib *lib_open(const char *path, char *err, size_t errsz)
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
                              NULL);
     if (rc != SQLITE_OK) {
-        snprintf(err, errsz, "cannot open the library '%s': %s", file,
+        snprintf(err, errsz, nanum_tr("cannot open the library '%s': %s"), file,
                  l->db ? sqlite3_errmsg(l->db) : "out of memory");
         goto fail;
     }
@@ -427,7 +421,7 @@ struct nanum_lib *lib_open(const char *path, char *err, size_t errsz)
         version = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     if (version > SCHEMA_VERSION) {
-        snprintf(err, errsz, "the library '%s' was written by a newer version", file);
+        snprintf(err, errsz, nanum_tr("the library '%s' was written by a newer version"), file);
         goto fail;
     }
     if (version < SCHEMA_VERSION) {
@@ -477,7 +471,7 @@ int64_t lib_media_ensure(struct nanum_lib *l, const char *key, const char *kind,
         bind_text(st, 3, name);
         sqlite3_bind_double(st, 4, duration);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "media update");
+            set_err(l, N_("media update"));
             id = 0;
             goto rollback;
         }
@@ -492,7 +486,7 @@ int64_t lib_media_ensure(struct nanum_lib *l, const char *key, const char *kind,
         sqlite3_bind_double(st, 5, duration);
         sqlite3_bind_int64(st, 6, time(NULL));
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "media insert");
+            set_err(l, N_("media insert"));
             goto rollback;
         }
         id = sqlite3_last_insert_rowid(l->db);
@@ -533,7 +527,7 @@ bool lib_lookup(struct nanum_lib *l, int64_t media_id, const char *source_key,
         out->src_lines = sqlite3_column_int(st, 5);
         out->src_created = sqlite3_column_int64(st, 6);
     } else if (rc != SQLITE_DONE) {
-        set_err(l, "lookup");
+        set_err(l, N_("lookup"));
         goto out;
     }
     sqlite3_reset(st);
@@ -556,7 +550,7 @@ bool lib_lookup(struct nanum_lib *l, int64_t media_id, const char *source_key,
             out->tr_failed = sqlite3_column_int(st, 5);
             out->tr_created = sqlite3_column_int64(st, 6);
         } else if (rc != SQLITE_DONE) {
-            set_err(l, "lookup");
+            set_err(l, N_("lookup"));
             goto out;
         }
         sqlite3_reset(st);
@@ -596,7 +590,7 @@ bool lib_load_cues(struct nanum_lib *l, void *ctx, int64_t source_rev, int64_t t
     }
     sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
-        set_err(l, "load cues");
+        set_err(l, N_("load cues"));
         talloc_free(*cues);
         *cues = NULL;
         *n = 0;
@@ -615,7 +609,7 @@ bool lib_load_cues(struct nanum_lib *l, void *ctx, int64_t source_rev, int64_t t
     }
     ok = *n > 0;
     if (!ok)
-        snprintf(l->err, sizeof(l->err), "the saved transcript is empty");
+        snprintf(l->err, sizeof(l->err), "%s", nanum_tr("the saved transcript is empty"));
 out:
     mp_mutex_unlock(&l->lock);
     return ok;
@@ -641,7 +635,7 @@ int64_t lib_save_source(struct nanum_lib *l, int64_t media_id, const char *sourc
     bind_text(st, 6, engine);
     sqlite3_bind_int64(st, 7, time(NULL));
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "source insert");
+        set_err(l, N_("source insert"));
         goto rollback;
     }
     if (!(st = Q(l, Q_SOURCE_SEL)))
@@ -649,7 +643,7 @@ int64_t lib_save_source(struct nanum_lib *l, int64_t media_id, const char *sourc
     sqlite3_bind_int64(st, 1, media_id);
     bind_text(st, 2, source_key);
     if (sqlite3_step(st) != SQLITE_ROW) {
-        set_err(l, "source select");
+        set_err(l, N_("source select"));
         goto rollback;
     }
     int64_t source_id = sqlite3_column_int64(st, 0);
@@ -661,7 +655,7 @@ int64_t lib_save_source(struct nanum_lib *l, int64_t media_id, const char *sourc
     bind_text(st, 2, language);
     bind_text(st, 3, engine);
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "source update");
+        set_err(l, N_("source update"));
         goto rollback;
     }
 
@@ -674,7 +668,7 @@ int64_t lib_save_source(struct nanum_lib *l, int64_t media_id, const char *sourc
     sqlite3_bind_int64(st, 5, (int64_t)n);
     sqlite3_bind_int64(st, 6, time(NULL));
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "revision insert");
+        set_err(l, N_("revision insert"));
         goto rollback;
     }
     int64_t rev_id = sqlite3_last_insert_rowid(l->db);
@@ -687,7 +681,7 @@ int64_t lib_save_source(struct nanum_lib *l, int64_t media_id, const char *sourc
         sqlite3_bind_double(st, 4, cues[i].dur);
         bind_text(st, 5, cues[i].src);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "cue insert");
+            set_err(l, N_("cue insert"));
             goto rollback;
         }
     }
@@ -724,7 +718,7 @@ int64_t lib_save_translation(struct nanum_lib *l, int64_t source_rev, const char
     sqlite3_bind_int(st, 6, failed);
     sqlite3_bind_int64(st, 7, time(NULL));
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "translation insert");
+        set_err(l, N_("translation insert"));
         goto rollback;
     }
     int64_t id = sqlite3_last_insert_rowid(l->db);
@@ -735,7 +729,7 @@ int64_t lib_save_translation(struct nanum_lib *l, int64_t source_rev, const char
         sqlite3_bind_int64(st, 2, (int64_t)i);
         bind_text(st, 3, cues[i].tr);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "translation cue insert");
+            set_err(l, N_("translation cue insert"));
             goto rollback;
         }
     }
@@ -743,7 +737,7 @@ int64_t lib_save_translation(struct nanum_lib *l, int64_t source_rev, const char
         goto rollback;
     sqlite3_bind_int64(st, 1, source_rev);
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "translation trim");
+        set_err(l, N_("translation trim"));
         goto rollback;
     }
     if (!exec(l, "COMMIT"))
@@ -755,7 +749,7 @@ int64_t lib_save_translation(struct nanum_lib *l, int64_t source_rev, const char
     if ((st = Q(l, Q_PRUNE))) {
         sqlite3_bind_int64(st, 1, source_rev);
         if (sqlite3_step(st) != SQLITE_DONE)
-            set_err(l, "prune");
+            set_err(l, N_("prune"));
     }
     goto out;
 rollback:
@@ -782,7 +776,7 @@ int64_t lib_job_begin(struct nanum_lib *l, int64_t source_id, const char *kind)
         if (sqlite3_step(st) == SQLITE_DONE)
             id = sqlite3_last_insert_rowid(l->db);
         else
-            set_err(l, "job insert");
+            set_err(l, N_("job insert"));
     }
     mp_mutex_unlock(&l->lock);
     return id;
@@ -800,7 +794,7 @@ void lib_job_end(struct nanum_lib *l, int64_t job, const char *state, const char
         bind_text(st, 3, error);
         sqlite3_bind_int64(st, 4, time(NULL));
         if (sqlite3_step(st) != SQLITE_DONE)
-            set_err(l, "job update");
+            set_err(l, N_("job update"));
     }
     mp_mutex_unlock(&l->lock);
 }
@@ -817,7 +811,7 @@ char *lib_prop_get(struct nanum_lib *l, void *ctx, int64_t media_id, const char 
         if (rc == SQLITE_ROW)
             v = talloc_strdup(ctx, (const char *)sqlite3_column_text(st, 0));
         else if (rc != SQLITE_DONE)
-            set_err(l, "property read");
+            set_err(l, N_("property read"));
         sqlite3_reset(st);
     }
     mp_mutex_unlock(&l->lock);
@@ -836,7 +830,7 @@ bool lib_prop_set(struct nanum_lib *l, int64_t media_id, const char *key, const 
             bind_text(st, 3, value);
         ok = sqlite3_step(st) == SQLITE_DONE;
         if (!ok)
-            set_err(l, "property write");
+            set_err(l, N_("property write"));
         sqlite3_reset(st);
     }
     mp_mutex_unlock(&l->lock);
@@ -852,7 +846,7 @@ static bool live_delete(struct nanum_lib *l, int q, int64_t media_id, const char
     sqlite3_bind_int64(st, 1, media_id);
     bind_text(st, 2, key);
     if (sqlite3_step(st) != SQLITE_DONE) {
-        set_err(l, "live delete");
+        set_err(l, N_("live delete"));
         return false;
     }
     return true;
@@ -884,7 +878,7 @@ bool lib_live_save(struct nanum_lib *l, int64_t media_id, const char *key,
         else
             sqlite3_bind_null(st, 7);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "live cue insert");
+            set_err(l, N_("live cue insert"));
             goto rollback;
         }
     }
@@ -898,7 +892,7 @@ bool lib_live_save(struct nanum_lib *l, int64_t media_id, const char *key,
         sqlite3_bind_double(st, 4, ranges[i].a);
         sqlite3_bind_double(st, 5, ranges[i].b);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            set_err(l, "live range insert");
+            set_err(l, N_("live range insert"));
             goto rollback;
         }
     }
@@ -943,7 +937,7 @@ bool lib_live_load(struct nanum_lib *l, void *ctx, int64_t media_id, const char 
     }
     sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
-        set_err(l, "load live cues");
+        set_err(l, N_("load live cues"));
         goto fail;
     }
     if (!(st = Q(l, Q_LIVE_RANGES)))
@@ -961,7 +955,7 @@ bool lib_live_load(struct nanum_lib *l, void *ctx, int64_t media_id, const char 
     }
     sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
-        set_err(l, "load live ranges");
+        set_err(l, N_("load live ranges"));
         goto fail;
     }
     ok = true;

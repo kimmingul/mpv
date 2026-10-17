@@ -39,6 +39,7 @@
 #include "misc/ctype.h"
 #include "misc/hash.h"
 #include "misc/io_utils.h"
+#include "misc/path_utils.h"
 #include "options/path.h"
 #include "options/m_config.h"
 #include "options/m_config_frontend.h"
@@ -301,7 +302,7 @@ void mp_write_watch_later_conf(struct MPContext *mpctx)
     struct playlist_entry *cur = mpctx->playing;
     char *conffile = NULL;
 
-    if (!cur)
+    if (!cur || mp_is_network_entry(cur->filename))
         goto exit;
 
     struct demuxer *demux = mpctx->demuxer;

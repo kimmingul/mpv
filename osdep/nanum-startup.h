@@ -2,7 +2,7 @@
  * NanumPlayer: native application startup (Windows).
  *
  * NanumPlayer.exe is the modified mpv itself. Everything the old launcher did
- * (config dir, engine/model paths, MakeMKV discovery, auto-loaded scripts) is
+ * (config dir, engine/model paths, disc libraries, auto-loaded scripts) is
  * done here, in process.
  *
  * This file is part of mpv, distributed under the GNU General Public License
@@ -19,8 +19,8 @@ struct MPContext;
 #ifdef _WIN32
 
 // Very first call from main(): process environment only (no mpv state yet).
-// Connects libbluray to the user's MakeMKV (LIBAACS_PATH / LIBBDPLUS_PATH)
-// unless the user, or a library next to the executable, already provides one.
+// Pins libbluray to the independent libraries in <app>\disc. No MakeMKV
+// discovery, console process, or legacy renamed libmmbd fallback is used.
 void nanum_startup_environment(void);
 
 // Called by mp_initialize() for the CLI player after the paths are known and

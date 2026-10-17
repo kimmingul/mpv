@@ -22,6 +22,7 @@
 #include "options/parse_configfile.h"
 #include "osdep/io.h"
 #include "osdep/nanum-open.h"
+#include "osdep/nanum-private.h"
 #include "nanum/nanum.h"
 #include "player/core.h"
 
@@ -349,7 +350,8 @@ void nanum_open_startup(struct MPContext *mpctx)
 // ---------------------------------------------------------------------------
 // Per file
 
-// <youtube dir>\cookies.txt (utf-8, talloc under ctx).
+// Private extractor copy: yt-dlp rewrites its cookie file on exit, possibly after
+// the browser session has closed. Never let that recreate the browser's file.
 static char *cookies_path(void *ctx)
 {
     wchar_t env[MAX_PATH];
@@ -367,7 +369,13 @@ static char *cookies_path(void *ctx)
     wchar_t *file = wfmt(ctx, L"%ls\\cookies.txt", dir);
     if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES)
         return NULL;
-    return mp_to_utf8(ctx, file);
+    char *session = nanum_private_dir(ctx);
+    if (!session)
+        return NULL;
+    wchar_t *copy = wfmt(ctx, L"%ls\\youtube-cookies.txt", mp_from_utf8(ctx, session));
+    if (!CopyFileW(file, copy, FALSE))
+        return NULL;
+    return mp_to_utf8(ctx, copy);
 }
 
 void nanum_open_prepare_file(struct MPContext *mpctx, const char *url)
@@ -376,7 +384,8 @@ void nanum_open_prepare_file(struct MPContext *mpctx, const char *url)
     if (!nanum_youtube_id(url, id, sizeof(id)))
         return;
     void *tmp = talloc_new(NULL);
-    // The library identifies the video by its id, not by the stream urls ytdl_hook opens.
+    // Marks the media as coming from the web: the engine saves nothing about it (the
+    // value is only held in memory for the length of this file).
     m_config_set_option_cli(mpctx->mconfig, bstr0("nanum-origin-url"), bstr0(url),
                             M_SETOPT_BACKUP);
     // yt-dlp reads the login cookies the YouTube window exported (never logged).

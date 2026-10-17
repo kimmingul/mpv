@@ -13,9 +13,6 @@ void mp_msg_force_stderr(struct mpv_global *global, bool force_stderr);
 bool mp_msg_has_status_line(struct mpv_global *global);
 bool mp_msg_has_log_file(struct mpv_global *global);
 void mp_msg_set_early_logging(struct mpv_global *global, bool enable);
-void mp_msg_set_log_policy(struct mpv_global *global, const char *path, int level,
-                           const char *modules, int max_bytes, int keep);
-void mp_msg_set_log_diagnostics(struct mpv_global *global, bool on);
 
 void mp_msg_flush_status_line(struct mp_log *log, bool clear);
 void mp_msg_set_term_title(struct mp_log *log, const char *title);

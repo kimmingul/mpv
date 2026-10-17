@@ -31,7 +31,10 @@
  * media, collects the whole transcript in a second engine instance and
  * translates it in one go into <full-dir>/<key>.ass.
  *
- * Library (nanum/library.c, SQLite): scans save their source transcript first and
+ * Library (nanum/library.c, SQLite), opt-in (--nanum-library-db=<file>; by default
+ * there is none, nanum-library-state is "disabled", and every result lives in memory
+ * and in the transient folder of osdep/nanum-private.h; media from the network never
+ * gets an identity at all): scans save their source transcript first and
  * the translation after it, as revisions per media and AI input. Opening a
  * known media offers the saved material (nanum-library-action: use / retranslate
  * the saved source / regenerate / disable). Media identity is the file content
@@ -92,10 +95,12 @@
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "osdep/nanum-accel.h"
+#include "osdep/nanum-private.h"
 #include "stream/stream.h"
 #include "nanum/nanum.h"
 #include "nanum/nanum_ai_api.h"
 #include "nanum/library.h"
+#include "nanum/i18n.h"
 
 #include <time.h>
 
@@ -104,6 +109,42 @@
 #include <dbghelp.h>
 #endif
 #include <stdlib.h>
+
+// ---------------------------------------------------------------------------
+// Localized messages. Text that stays visible (reasons, notes, errors) is stored in the
+// encoded form of NANUM_MSG() and rendered when the status is read, so it follows the UI
+// language. Text that does not start with the encoding mark is raw (an external diagnostic).
+
+static const char *sstr(const char *s)
+{
+    return s ? s : "";
+}
+
+// Stored form of a message without arguments. The result lives in a small per-thread ring:
+// use it at once (copy it into a status field or pass it on).
+static const char *msgl(const char *key)
+{
+    static _Thread_local char ring[8][320];
+    static _Thread_local unsigned next;
+    char *b = ring[next++ % 8];
+    nanum_msg(b, sizeof(ring[0]), key, (const char *)NULL);
+    return b;
+}
+
+// English text of a stored message, for the log.
+static const char *msg_en(const char *stored, char *buf, size_t sz)
+{
+    nanum_msg_render_lang(stored, buf, sz, NANUM_UI_EN);
+    return buf;
+}
+
+// What the title of a virtual track is made of (it is rebuilt when the UI language changes).
+struct title_spec {
+    int kind;                   // 0: not set, 1: AI (audio/subtitle), 2: image subtitles, 3: import
+    bool audio, direct;
+    char lang[16];
+    char origin[64];
+};
 
 enum { INPUT_STT, INPUT_SUB };
 enum { ENGINE_OLLAMA, ENGINE_OMP };
@@ -289,10 +330,11 @@ static const char *const fs_names[] = {
     [FS_OFF] = "off", [FS_SCANNING] = "scanning",
     [FS_TRANSLATING] = "translating", [FS_DONE] = "done", [FS_ERROR] = "error",
 };
-enum { LS_LOADING, LS_NONE, LS_AVAILABLE, LS_USING, LS_WORKING, LS_ERROR };
+enum { LS_LOADING, LS_NONE, LS_AVAILABLE, LS_USING, LS_WORKING, LS_ERROR, LS_DISABLED };
 static const char *const ls_names[] = {
     [LS_LOADING] = "loading", [LS_NONE] = "none", [LS_AVAILABLE] = "available",
     [LS_USING] = "using", [LS_WORKING] = "working", [LS_ERROR] = "error",
+    [LS_DISABLED] = "disabled",
 };
 // State of the AI engine of this file (demuxer-cache-state "nanum-ai-*").
 enum { AI_UNAVAILABLE, AI_READY, AI_FAILED };
@@ -705,9 +747,11 @@ struct nanum {
     char **title_pool;
     int ntitle_pool;
     atomic_uint title_gen;
+    struct title_spec tspec[NANUM_INPUTS];
 
     // Library and the finished result kept for re-rendering (rlock).
     struct nanum_lib *lib;
+    bool lib_off;               // no library: nothing about any media is saved
     char lib_open_err[256];
     mp_mutex rlock;
     void *dctx;                 // owns dcues and the strings below
@@ -749,7 +793,25 @@ struct pgs_plan {
     char reason[256];           // why none is usable
 };
 static void pgs_replan(struct nanum *n, struct pgs_plan *out);
-static const char *lang_name_ko(const char *iso1);
+static const char *lang_name(const char *iso1);
+static const char *lang_arg(const char *iso1, char *buf, size_t sz);
+
+// Whether the media comes from the network (web page, stream, yt-dlp url). Such media
+// leaves nothing behind: no library identity, no translation cache, no result file
+// outside the transient session folder.
+static bool net_media(struct nanum *n)
+{
+    if (n->opts->origin_url && n->opts->origin_url[0])
+        return true;
+    mp_mutex_lock(&n->slock);
+    // An edl:// timeline (yt-dlp's separate video and audio streams) holds its parts'
+    // addresses.
+    bool net = mp_is_network_entry(n->url) ||
+               (n->url && !strncasecmp(n->url, "edl://", 6) &&
+                (strstr(n->url, "http://") || strstr(n->url, "https://")));
+    mp_mutex_unlock(&n->slock);
+    return net;
+}
 
 static void set_ai(struct nanum *n, int state, const char *backend, const char *reason,
                    const char *notice)
@@ -764,15 +826,11 @@ static void set_ai(struct nanum *n, int state, const char *backend, const char *
 
 // The engine of an input stopped working: the preroll must not wait for it any more.
 // (The secondary input only loses itself; the file keeps its AI state.)
-static void ai_fail(struct input *in, const char *fmt, ...) MP_PRINTF_ATTRIBUTE(2, 3);
-static void ai_fail(struct input *in, const char *fmt, ...)
+static void ai_fail(struct input *in, const char *stored)
 {
     struct nanum *n = in->n;
     char msg[sizeof(n->ai_reason)];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
+    snprintf(msg, sizeof(msg), "%s", stored);
     mp_mutex_lock(&n->slock);
     if (in->idx == IN_PRI) {
         n->ai_state = AI_FAILED;
@@ -2696,7 +2754,11 @@ static char *pgs_ocr(void *ctx, struct input *in, const AVSubtitle *sub)
             if (++in->ocr_fail <= 3)
                 mp_warn(n->log, "OCR failed: %s\n", n->api.last_error());
             if (in->ocr_fail >= 5)
-                ai_fail(in, "the OCR does not work: %s", n->api.last_error());
+            {
+                char m[512];
+                NANUM_MSG(m, N_("the OCR does not work: %s"), sstr(n->api.last_error()));
+                ai_fail(in, m);
+            }
             continue;
         }
         in->ocr_fail = 0;
@@ -2745,7 +2807,7 @@ static void pgs_decode(struct input *in, struct apkt *a)
     if (!a->dp || a->dp->pts == MP_NOPTS_VALUE)
         return;
     if ((!in->vctx || in->vcodec != a->codec) && !pgs_open_decoder(in, a->codec)) {
-        ai_fail(in, "cannot open the image subtitle decoder");
+        ai_fail(in, msgl(N_("cannot open the image subtitle decoder")));
         return;
     }
     AVPacket *pkt = av_packet_alloc();
@@ -2856,9 +2918,14 @@ static MP_THREAD_VOID audio_thread(void *p)
     bool primary = in->idx == IN_PRI;
     mp_thread_set_name(primary ? "nanum-audio" : in->idx == IN_PGS ? "nanum-pgs" : "nanum-audio2");
 
-    // Streams are not known when the primary worker starts. Wait for the first input
-    // so Japanese-only installations do not try to load the English model.
+    // Streams are not known when the primary worker starts. Wait for the first input so the
+    // engine starts with the model its language needs. Speech recognition of audio without a
+    // language tag starts as "auto" (the multilingual model detects the language itself): assuming
+    // English would load the English-only model first and read other languages with it.
+    bool stt_input = in->idx == IN_SEC || (primary && atomic_load(&n->a_mode) == MODE_STT);
     char initial_language[sizeof(in->alang)] = "en";
+    if (stt_input)
+        snprintf(initial_language, sizeof(initial_language), "auto");
     mp_mutex_lock(&in->alock);
     if (primary) {
         while (!in->astop && !in->aswitch && !in->ahead)
@@ -2892,7 +2959,7 @@ static MP_THREAD_VOID audio_thread(void *p)
         .translate_endpoint = o->tr_endpoint,
         .translate_model = o->tr_model,
         .target_language = o->target_language,
-        .cache_path = o->cache,
+        .cache_path = net_media(n) ? NULL : o->cache,
         .translate_only = (primary && atomic_load(&n->a_mode) != MODE_STT) || in->idx == IN_PGS,
         .translate_style = ts.style,
         .translate_style_text = ts.style_text,
@@ -2904,8 +2971,12 @@ static MP_THREAD_VOID audio_thread(void *p)
     if (!in->ai) {
         mp_err(n->log, "cannot start the AI engine%s: %s\n", primary ? "" : " (secondary)",
                n->api.last_error());
-        ai_fail(in, "cannot start the AI engine (%s): %s", n->engine.backend,
-                n->api.last_error());
+        {
+            char m[512];
+            NANUM_MSG(m, N_("cannot start the AI engine (%s): %s"), n->engine.backend,
+                      sstr(n->api.last_error()));
+            ai_fail(in, m);
+        }
         MP_THREAD_RETURN();
     }
     in->dec.ai = in->ai;
@@ -3051,7 +3122,7 @@ static MP_THREAD_VOID audio_thread(void *p)
         }
 
         if (!in->dec.avctx && !open_decoder(&in->dec)) {
-            ai_fail(in, "cannot open the audio decoder of the AI input");
+            ai_fail(in, msgl(N_("cannot open the audio decoder of the AI input")));
             talloc_free(a->dp);
             talloc_free(a);
             mp_mutex_lock(&in->alock);
@@ -3254,8 +3325,10 @@ static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_e
         !api->set_glossary || !api->set_style || !api->get_glossary || !api->profile ||
         !api->ocr || !api->ocr_languages)
     {
-        snprintf(why, whysz, "'%s' does not export the nanum_ai API (ABI %d)",
-                 eng->path, NANUM_AI_ABI_VERSION);
+        char abi[16];
+        snprintf(abi, sizeof(abi), "%d", NANUM_AI_ABI_VERSION);
+        nanum_msg(why, whysz, N_("'%s' does not export the nanum_ai API (ABI %s)"), eng->path,
+                  abi, (const char *)NULL);
         nanum_accel_unload_engine(eng);
         return false;
     }
@@ -3268,7 +3341,8 @@ static bool load_engine(struct nanum *n)
     enum nanum_accel_mode mode = atomic_load(&n->a_mode) == MODE_STT
                                 ? n->opts->acceleration : NANUM_ACCEL_CPU;
     if (!load_api(n, mode, &n->engine, &n->api, why, sizeof(why))) {
-        mp_err(n->log, "cannot start the AI engine: %s\n", why);
+        char en[1024];
+        mp_err(n->log, "cannot start the AI engine: %s\n", msg_en(why, en, sizeof(en)));
         set_ai(n, AI_UNAVAILABLE, "", why, "");
         return false;
     }
@@ -3298,14 +3372,14 @@ static void unload_engine(struct nanum *n)
 static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_engine *eng,
                      struct nanum_ai_api *api, char *why, size_t whysz)
 {
-    snprintf(why, whysz, "the AI engine is only available on Windows");
+    nanum_msg(why, whysz, N_("the AI engine is only available on Windows"), (const char *)NULL);
     return false;
 }
 
 static bool load_engine(struct nanum *n)
 {
     mp_err(n->log, "the AI engine is only available on Windows\n");
-    set_ai(n, AI_UNAVAILABLE, "", "the AI engine is only available on Windows", "");
+    set_ai(n, AI_UNAVAILABLE, "", msgl(N_("the AI engine is only available on Windows")), "");
     return false;
 }
 static void unload_api(struct nanum_engine *eng) {}
@@ -3365,7 +3439,7 @@ static bool input_start(struct input *in)
         return true;
     }
     atomic_store(&in->active, false);
-    ai_fail(in, "cannot start the audio thread");
+    ai_fail(in, msgl(N_("cannot start the audio thread")));
     return false;
 }
 
@@ -3385,11 +3459,11 @@ static void start_live(struct nanum *n)
         bool have_stt = n->opts->stt_model && n->opts->stt_model[0];
         bool have_vad = n->opts->vad_model && n->opts->vad_model[0];
         if (!have_stt) {
-            set_ai(n, AI_UNAVAILABLE, "", "no speech model is configured (nanum-stt-model)", "");
+            set_ai(n, AI_UNAVAILABLE, "", msgl(N_("no speech model is configured (nanum-stt-model)")), "");
             return;
         }
         if (!have_vad) {
-            set_ai(n, AI_UNAVAILABLE, "", "nanum-stt-model needs nanum-vad-model", "");
+            set_ai(n, AI_UNAVAILABLE, "", msgl(N_("nanum-stt-model needs nanum-vad-model")), "");
             return;
         }
         bool stt_ok = mp_path_exists(n->opts->stt_model) ||
@@ -3398,10 +3472,14 @@ static void start_live(struct nanum *n)
         bool vad_ok = mp_path_exists(n->opts->vad_model);
         if (!stt_ok || !vad_ok) {
             char why[sizeof(n->ai_reason)];
-            snprintf(why, sizeof(why), "The speech models are not installed (missing: %s%s%s). "
-                     "Download them in the AI settings.", stt_ok ? "" : "Whisper speech model",
-                     !stt_ok && !vad_ok ? ", " : "", vad_ok ? "" : "voice detection model");
-            mp_info(n->log, "AI subtitles are off: %s\n", why);
+            if (!stt_ok && !vad_ok)
+                NANUM_MSG(why, N_("The speech models are not installed (missing: %s and %s). Download them in the AI settings."),
+                          NANUM_ARG("Whisper speech model"), NANUM_ARG("voice detection model"));
+            else
+                NANUM_MSG(why, N_("The speech models are not installed (missing: %s). Download them in the AI settings."),
+                          stt_ok ? NANUM_ARG("voice detection model") : NANUM_ARG("Whisper speech model"));
+            char en[sizeof(n->ai_reason)];
+            mp_info(n->log, "AI subtitles are off: %s\n", msg_en(why, en, sizeof(en)));
             set_ai(n, AI_UNAVAILABLE, "", why, "");
             return;
         }
@@ -3459,21 +3537,21 @@ void nanum_get_status(struct nanum *n, struct nanum_status *st)
     st->full_state = fs_names[n->fstate];
     st->full_progress = n->fprogress;
     memcpy(st->full_file, n->ffile, sizeof(st->full_file));
-    memcpy(st->full_error, n->ferror, sizeof(st->full_error));
+    nanum_msg_render(n->ferror, st->full_error, sizeof(st->full_error));
     st->lib_state = ls_names[n->lstate];
     memcpy(st->lib_source_id, n->lsrc_id, sizeof(st->lib_source_id));
     memcpy(st->lib_source_lang, n->lsrc_lang, sizeof(st->lib_source_lang));
     st->lib_has_source = n->lhas_src;
     st->lib_has_translation = n->lhas_tr;
-    memcpy(st->lib_summary, n->lsummary, sizeof(st->lib_summary));
-    memcpy(st->lib_error, n->lerror, sizeof(st->lib_error));
+    nanum_msg_render(n->lsummary, st->lib_summary, sizeof(st->lib_summary));
+    nanum_msg_render(n->lerror, st->lib_error, sizeof(st->lib_error));
     st->ai_state = ai_names[n->ai_state];
     memcpy(st->ai_backend, n->ai_backend, sizeof(st->ai_backend));
-    memcpy(st->ai_reason, n->ai_reason, sizeof(st->ai_reason));
-    memcpy(st->ai_notice, n->ai_notice, sizeof(st->ai_notice));
+    nanum_msg_render(n->ai_reason, st->ai_reason, sizeof(st->ai_reason));
+    nanum_msg_render(n->ai_notice, st->ai_notice, sizeof(st->ai_notice));
     st->sec_state = ss_names[n->sec_state];
     memcpy(st->sec_lang, n->sec_lang, sizeof(st->sec_lang));
-    memcpy(st->sec_reason, n->sec_reason, sizeof(st->sec_reason));
+    nanum_msg_render(n->sec_reason, st->sec_reason, sizeof(st->sec_reason));
     st->profile_state = ps_names[n->prof_state];
     memcpy(st->profile_work, n->prof_work, sizeof(st->profile_work));
     memcpy(st->original_lang, n->orig_lang, sizeof(st->original_lang));
@@ -3482,20 +3560,23 @@ void nanum_get_status(struct nanum *n, struct nanum_status *st)
     st->gl_state = gs_names[n->gl_state];
     st->gl_progress = n->gl_progress;
     st->gl_changed = n->gl_changed;
-    memcpy(st->gl_error, n->gl_error, sizeof(st->gl_error));
+    nanum_msg_render(n->gl_error, st->gl_error, sizeof(st->gl_error));
     st->pgs_state = ss_names[n->pgs_state];
     memcpy(st->pgs_lang, n->pgs_lang, sizeof(st->pgs_lang));
-    memcpy(st->pgs_reason, n->pgs_reason, sizeof(st->pgs_reason));
+    nanum_msg_render(n->pgs_reason, st->pgs_reason, sizeof(st->pgs_reason));
     st->imp_state = is_names[n->imp_state];
     st->imp_progress = n->imp_progress;
-    memcpy(st->imp_error, n->imp_error, sizeof(st->imp_error));
-    memcpy(st->imp_note, n->imp_note, sizeof(st->imp_note));
+    nanum_msg_render(n->imp_error, st->imp_error, sizeof(st->imp_error));
+    nanum_msg_render(n->imp_note, st->imp_note, sizeof(st->imp_note));
     st->imp_offset = n->imp_offset;
     st->imp_scale = n->imp_scale;
     st->imp_confidence = n->imp_conf;
     st->imp_low_confidence = n->imp_low;
     memcpy(st->imp_lang, n->imp_lang, sizeof(st->imp_lang));
-    memcpy(st->imp_origin, n->imp_origin, sizeof(st->imp_origin));
+    if (!strcmp(n->imp_origin, "파일"))
+        snprintf(st->imp_origin, sizeof(st->imp_origin), "%s", nanum_tr("파일"));
+    else
+        memcpy(st->imp_origin, n->imp_origin, sizeof(st->imp_origin));
     st->imp_lines = n->imp_lines;
     mp_mutex_unlock(&n->slock);
     st->input_active = atomic_load(&n->a_mode) == MODE_STT ? "stt" : "sub";
@@ -3512,11 +3593,17 @@ void nanum_get_status(struct nanum *n, struct nanum_status *st)
     st->pgs_ready = r;
 }
 
-// Library state as shown in demuxer-cache-state (nanum-library-*).
+// Library state as shown in demuxer-cache-state (nanum-library-*). Without a
+// library (the default, see nanum_create()) the state is always "disabled".
 static void set_lib(struct nanum *n, int state, const char *source_id,
                     const char *lang, bool has_src, bool has_tr, const char *summary,
                     const char *err)
 {
+    if (n->lib_off) {
+        state = LS_DISABLED;
+        source_id = lang = summary = err = "";
+        has_src = has_tr = false;
+    }
     mp_mutex_lock(&n->slock);
     n->lstate = state;
     snprintf(n->lsrc_id, sizeof(n->lsrc_id), "%s", source_id ? source_id : "");
@@ -3616,14 +3703,17 @@ static bool pick_ocr_lang(const char *installed, const char *lang, char ocr[8], 
         for (size_t i = 0; i < MP_ARRAY_SIZE(fallback); i++) {
             if (csv_has(installed, fallback[i])) {
                 snprintf(ocr, 8, "%s", fallback[i]);
-                snprintf(note, nsz, "%s OCR 팩 없음: %s 인식기로 읽는 중", lang_name_ko(lang),
-                         lang_name_ko(fallback[i]));
+                char la[24], lb[24];
+                nanum_msg(note, nsz, N_("%s OCR 팩 없음: %s 인식기로 읽는 중"),
+                          lang_arg(lang, la, sizeof(la)), lang_arg(fallback[i], lb, sizeof(lb)),
+                          (const char *)NULL);
                 return true;
             }
         }
     }
-    snprintf(reason, rsz, "%s OCR 언어 팩이 없습니다 (Windows 설정 > 시간 및 언어 > 언어 및 지역에서 추가)",
-             lang_name_ko(lang));
+    char la[24];
+    nanum_msg(reason, rsz, N_("%s OCR 언어 팩이 없습니다 (Windows 설정 > 시간 및 언어 > 언어 및 지역에서 추가)"),
+              lang_arg(lang, la, sizeof(la)), (const char *)NULL);
     return false;
 }
 
@@ -3650,7 +3740,7 @@ static void pgs_replan(struct nanum *n, struct pgs_plan *p)
         if (!strcmp(l, "auto")) {
             if (score > bad_score) {
                 bad_score = score;
-                snprintf(bad_reason, sizeof(bad_reason), "the image subtitle has no language");
+                NANUM_MSG(bad_reason, N_("the image subtitle has no language"));
             }
             continue;
         }
@@ -3659,7 +3749,7 @@ static void pgs_replan(struct nanum *n, struct pgs_plan *p)
             if (score > bad_score) {
                 bad_score = score;
                 snprintf(bad_reason, sizeof(bad_reason), "%s",
-                         n->ocr_known ? reason : "the OCR is not available");
+                         n->ocr_known ? reason : msgl(N_("the OCR is not available")));
             }
             continue;
         }
@@ -3676,7 +3766,7 @@ static void pgs_replan(struct nanum *n, struct pgs_plan *p)
     mp_mutex_unlock(&n->slock);
     if (!p->ok)
         snprintf(p->reason, sizeof(p->reason), "%s",
-                 bad_reason[0] ? bad_reason : "no image subtitle track");
+                 bad_reason[0] ? bad_reason : msgl(N_("no image subtitle track")));
     bool enabled = atomic_load(&n->pgs_enabled) && atomic_load(&n->ai_enabled) && p->ok;
     atomic_store(&in->pin_id, enabled ? p->id : -1);
     atomic_store(&in->pin_idx, enabled ? p->idx : -1);
@@ -3863,13 +3953,19 @@ static void make_summary(const struct lib_found *f, char *buf, size_t sz)
     if (tm)
         strftime(date, sizeof(date), "%Y-%m-%d %H:%M", tm);
     if (f->has_tr) {
-        int n = snprintf(buf, sz, "%s -> %s | %s | %s", f->src_lang, f->tr_target,
-                         f->tr_model, date);
-        if (f->tr_failed > 0 && n > 0 && (size_t)n < sz)
-            snprintf(buf + n, sz - n, " | %d untranslated", f->tr_failed);
+        char base[256];
+        snprintf(base, sizeof(base), "%s -> %s | %s | %s", f->src_lang, f->tr_target,
+                 f->tr_model, date);
+        if (f->tr_failed > 0) {
+            char cnt[16];
+            snprintf(cnt, sizeof(cnt), "%d", f->tr_failed);
+            nanum_msg(buf, sz, N_("%s | %s untranslated"), base, cnt, (const char *)NULL);
+        } else {
+            snprintf(buf, sz, "%s", base);
+        }
     } else if (f->has_source) {
-        snprintf(buf, sz, "%s source, not translated | %s | %s", f->src_lang,
-                 f->src_engine, date);
+        nanum_msg(buf, sz, N_("%s source, not translated | %s | %s"), sstr(f->src_lang),
+                  sstr(f->src_engine), date, (const char *)NULL);
     } else {
         buf[0] = '\0';
     }
@@ -3923,7 +4019,7 @@ static const char *write_ass_file(const char *dir, const char *path,
     FILE *f = fopen(tmp, "wb");
     if (!f) {
         talloc_free(tmpctx);
-        return "cannot write the translation file";
+        return msgl(N_("cannot write the translation file"));
     }
     fwrite(ass_header, 1, sizeof(ass_header) - 1, f);
     for (size_t i = 0; i < nc; i++) {
@@ -3944,10 +4040,10 @@ static const char *write_ass_file(const char *dir, const char *path,
     const char *err = NULL;
     if (bad) {
         unlink(tmp);
-        err = "cannot write the translation file";
+        err = msgl(N_("cannot write the translation file"));
     } else if (rename(tmp, path) != 0) {
         unlink(tmp);
-        err = "cannot move the translation file into place";
+        err = msgl(N_("cannot move the translation file into place"));
     }
     talloc_free(tmpctx);
     return err;
@@ -3981,7 +4077,8 @@ static void render_done(struct nanum *n, bool announce)
     done = n->fstate == FS_DONE;
     mp_mutex_unlock(&n->slock);
     if (err) {
-        mp_err(n->log, "%s: %s\n", err, path);
+        char en[320];
+        mp_err(n->log, "%s: %s\n", msg_en(err, en, sizeof(en)), path);
         if (announce || done)
             set_full(n, FS_ERROR, 0, "", err);
     } else if (announce || done) {
@@ -4031,14 +4128,18 @@ static void publish_done(struct nanum *n, const char *dir, const char *stem,
     render_done(n, true);
 }
 
-static char *result_dir(void *ctx, const struct rt_cfg *c)
+// Where the subtitle file handed to the player goes: the transient folder of this
+// process (emptied when the next media opens, removed at exit), unless the user
+// named a folder with --nanum-full-dir and the media is not from the network.
+static char *result_dir(void *ctx, struct nanum *n, const struct rt_cfg *c)
 {
     char *dir;
-    if (c->full_dir[0]) {
+    if (c->full_dir[0] && !net_media(n)) {
         dir = talloc_strdup(ctx, c->full_dir);
     } else {
-        const char *base = getenv("LOCALAPPDATA");
-        dir = talloc_asprintf(ctx, "%s/NanumPlayer/full", base && base[0] ? base : ".");
+        dir = nanum_private_dir(ctx);
+        if (!dir)       // no transient folder: a path that cannot be created
+            dir = talloc_strdup(ctx, "?:/nanum-no-session-folder");
     }
     for (char *s = dir; *s; s++) {
         if (*s == '\\')
@@ -4079,24 +4180,22 @@ static const char *job_name(const struct job *j)
                                                                         : "subtitle file";
 }
 
-static void job_error(struct job *j, const char *fmt, ...) MP_PRINTF_ATTRIBUTE(2, 3);
-static void job_error(struct job *j, const char *fmt, ...)
+static void job_error(struct job *j, const char *stored)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    char *msg = talloc_vasprintf(NULL, fmt, ap);
-    va_end(ap);
+    char *msg = talloc_strdup(NULL, stored);
     for (char *s = msg; *s; s++) {
         if (*s == '\n' || *s == '\r')
             *s = ' ';
     }
-    mp_err(j->n->log, "%s: %s\n", job_name(j), msg);
+    char en[512];
+    msg_en(msg, en, sizeof(en));
+    mp_err(j->n->log, "%s: %s\n", job_name(j), en);
     if (j->kind != JOB_EXT && !job_cancelled(j)) {
         set_full(j->n, FS_ERROR, 0, "", msg);
         // Whatever was saved before stays available.
         lib_publish(j->n, &j->ls, LS_ERROR, msg);
         if (j->job_row)
-            lib_job_end(j->n->lib, j->job_row, "failed", msg);
+            lib_job_end(j->n->lib, j->job_row, "failed", en);
         j->job_row = 0;
     }
     talloc_free(msg);
@@ -4117,7 +4216,7 @@ static const char *open_source(struct job *j, const char *url, bool audio,
     };
     struct demuxer *d = demux_open_url(url, &p, j->mpcancel, n->global);
     if (!d)
-        return "cannot open the source";
+        return msgl(N_("cannot open the source"));
 
     struct sh_stream *pick = NULL, *fallback = NULL;
     int num = demux_get_num_stream(d);
@@ -4149,9 +4248,9 @@ static const char *open_source(struct job *j, const char *url, bool audio,
         pick = fallback;
     if (!pick) {
         demux_free(d);
-        return audio ? (j->a_srcid >= 0 ? "the pinned audio track was not found"
-                                        : "the media has no audio track")
-                     : "the text subtitle track was not found";
+        return audio ? (j->a_srcid >= 0 ? msgl(N_("the pinned audio track was not found"))
+                                        : msgl(N_("the media has no audio track")))
+                     : msgl(N_("the text subtitle track was not found"));
     }
     demuxer_select_track(d, pick, MP_NOPTS_VALUE, true);
     *out_d = d;
@@ -4245,7 +4344,7 @@ static int job_translate(struct job *j, struct nanum_ai *ai, char *errbuf, size_
     const struct nanum_ai_api *api = j->kind == JOB_IMPORT ? &j->api : &n->api;
     job_progress(j, 0);
     if (api->translate_all(ai, full_cb, j)) {
-        snprintf(errbuf, esz, "cannot start the translation");
+        nanum_msg(errbuf, esz, N_("cannot start the translation"), (const char *)NULL);
         return -1;
     }
     mp_mutex_lock(&j->dlock);
@@ -4292,7 +4391,7 @@ static const char *job_finish(struct job *j, struct nanum_ai *ai)
 {
     struct nanum *n = j->n;
     if (j->nlines != j->nsrc)
-        return "the translation does not match the transcript";
+        return msgl(N_("the translation does not match the transcript"));
     struct lib_cue *cues = talloc_array(j, struct lib_cue, j->nlines);
     for (size_t i = 0; i < j->nlines; i++) {
         cues[i] = (struct lib_cue){
@@ -4308,13 +4407,13 @@ static const char *job_finish(struct job *j, struct nanum_ai *ai)
         tr_id = lib_save_translation(n->lib, j->ls.source_rev, j->ls.target,
                                      j->ls.tr_engine, j->ls.tr_model, cues, j->nlines);
         if (!tr_id) {
-            snprintf(warn, sizeof(warn), "cannot save the translation: %s",
-                     lib_error(n->lib));
-            mp_err(n->log, "%s\n", warn);
+            NANUM_MSG(warn, N_("cannot save the translation: %s"), sstr(lib_error(n->lib)));
+            char en[320];
+            mp_err(n->log, "%s\n", msg_en(warn, en, sizeof(en)));
         }
     }
     void *tmp = talloc_new(NULL);
-    char *dir = result_dir(tmp, j->cfg);
+    char *dir = result_dir(tmp, j->n, j->cfg);
     char *stem = result_stem(tmp, &j->ls, tr_id);
     // The job row is closed ("done") before anything is published, so a cancel
     // arriving afterwards (e.g. quitting) cannot turn a finished job into a
@@ -4353,8 +4452,12 @@ static void scan_run(struct job *j)
         return;
 
     const char *src = sub && c->sub_file[0] ? c->sub_file : j->url;
-    mp_info(n->log, "full scan of '%.100s%s' (%s)\n", src, strlen(src) > 100 ? "..." : "",
-            sub ? "subtitle track" : "audio");
+    if (net_media(n))
+        mp_info(n->log, "full scan of a network source (%s)\n",
+                sub ? "subtitle track" : "audio");
+    else
+        mp_info(n->log, "full scan of '%.100s%s' (%s)\n", src, strlen(src) > 100 ? "..." : "",
+                sub ? "subtitle track" : "audio");
     err = open_source(j, src, !sub, sub && c->sub_file[0], &d, &sh);
     if (err)
         goto fail;
@@ -4391,8 +4494,7 @@ static void scan_run(struct job *j)
     cfg.glossary = ts.glossary;
     ai = n->api.create(&cfg, scan_event_cb, j);
     if (!ai) {
-        snprintf(errbuf, sizeof(errbuf), "cannot start the scan engine: %s",
-                 n->api.last_error());
+        NANUM_MSG(errbuf, N_("cannot start the scan engine: %s"), sstr(n->api.last_error()));
         err = errbuf;
         goto fail;
     }
@@ -4419,7 +4521,7 @@ static void scan_run(struct job *j)
             } else {
                 if (!dec.avctx && !open_decoder(&dec)) {
                     talloc_free(pkt);
-                    err = "cannot decode the audio";
+                    err = msgl(N_("cannot decode the audio"));
                     goto fail;
                 }
                 decode_packet(&dec, pkt);
@@ -4483,7 +4585,7 @@ static void scan_run(struct job *j)
     // translation fails or is cancelled it can be retranslated later.
     n->api.transcript_export(ai, export_cb, j);
     if (j->nsrc == 0) {
-        err = sub ? "the subtitle track has no text" : "no speech was recognised";
+        err = sub ? msgl(N_("the subtitle track has no text")) : msgl(N_("no speech was recognised"));
         goto fail;
     }
     mp_info(n->log, "transcript: %zu lines, translating\n", j->nsrc);
@@ -4493,8 +4595,7 @@ static void scan_run(struct job *j)
                                            j->ls.engine, j->ls.origin, j->src, j->nsrc);
         if (!j->ls.source_rev) {
             mp_err(n->log, "cannot save the transcript: %s\n", lib_error(n->lib));
-            snprintf(j->ls.warn, sizeof(j->ls.warn), "results are not saved: %s",
-                     lib_error(n->lib));
+            NANUM_MSG(j->ls.warn, N_("results are not saved: %s"), sstr(lib_error(n->lib)));
             j->ls.save = false;     // translate anyway, just do not store anything
         } else {
             lib_publish(n, &j->ls, LS_WORKING, NULL);
@@ -4514,7 +4615,7 @@ static void scan_run(struct job *j)
     goto out;
 
 fail:
-    job_error(j, "%s", err);
+    job_error(j, err);
 out:
     if (ai) {
         n->api.cancel_full(ai);     // no callback after this
@@ -4538,8 +4639,7 @@ static void retr_run(struct job *j)
     mp_info(n->log, "retranslating the saved transcript (revision %lld)\n",
             (long long)j->ls.source_rev);
     if (!lib_load_cues(n->lib, j, j->ls.source_rev, 0, &j->src, &j->nsrc, NULL)) {
-        snprintf(errbuf, sizeof(errbuf), "cannot load the saved transcript: %s",
-                 lib_error(n->lib));
+        NANUM_MSG(errbuf, N_("cannot load the saved transcript: %s"), sstr(lib_error(n->lib)));
         err = errbuf;
         goto fail;
     }
@@ -4562,17 +4662,19 @@ static void retr_run(struct job *j)
     cfg.glossary = ts.glossary;
     ai = n->api.create(&cfg, scan_event_cb, j);
     if (!ai) {
-        snprintf(errbuf, sizeof(errbuf), "cannot start the translation engine: %s",
-                 n->api.last_error());
+        NANUM_MSG(errbuf, N_("cannot start the translation engine: %s"),
+                  sstr(n->api.last_error()));
         err = errbuf;
         goto fail;
     }
     for (size_t i = 0; i < j->nsrc; i++)
         n->api.push_text(ai, j->src[i].pts, j->src[i].dur, j->src[i].src);
     if (n->api.transcript_size(ai) != j->nsrc) {
-        snprintf(errbuf, sizeof(errbuf),
-                 "the saved transcript could not be restored (%zu of %zu lines)",
-                 n->api.transcript_size(ai), j->nsrc);
+        char got[24], want[24];
+        snprintf(got, sizeof(got), "%zu", n->api.transcript_size(ai));
+        snprintf(want, sizeof(want), "%zu", j->nsrc);
+        NANUM_MSG(errbuf, N_("the saved transcript could not be restored (%s of %s lines)"),
+                  got, want);
         err = errbuf;
         goto fail;
     }
@@ -4589,7 +4691,7 @@ static void retr_run(struct job *j)
     goto out;
 
 fail:
-    job_error(j, "%s", err);
+    job_error(j, err);
 out:
     if (ai) {
         n->api.cancel_full(ai);
@@ -4607,7 +4709,12 @@ static void ext_run(struct job *j)
     if (err) {
         // (a job that was replaced while it opened the file is not a failure)
         if (!job_cancelled(j))
-            job_error(j, "%s (%.100s)", err, j->cfg->sub_file);
+        {
+            char r[256], m[400];
+            nanum_msg_render(err, r, sizeof(r));
+            snprintf(m, sizeof(m), "%s (%.100s)", r, j->cfg->sub_file);
+            job_error(j, m);
+        }
         return;
     }
     {
@@ -4901,8 +5008,6 @@ bool nanum_youtube_id(const char *url, char *id, size_t sz)
     return false;
 }
 
-static char *media_title_opt(void *ctx, struct nanum *n);
-
 static void ctl_ident(struct ctl *c)
 {
     struct nanum *n = c->n;
@@ -4915,24 +5020,10 @@ static void ctl_ident(struct ctl *c)
         snprintf(c->ident_err, sizeof(c->ident_err), "%s", n->lib_open_err);
         return;
     }
-    // A YouTube video is the same media whichever stream urls yt-dlp resolves today.
-    char vid[16];
-    if (nanum_youtube_id(n->opts->origin_url, vid, sizeof(vid))) {
-        char *title = media_title_opt(c->ictx, n);
-        c->media_kind = "youtube";
-        c->media_name = title && title[0] ? title : talloc_strdup(c->ictx, vid);
-        c->media_size = 0;
-        c->media_key = talloc_asprintf(c->ictx, "youtube|%s", vid);
-        c->media_id = lib_media_ensure(n->lib, c->media_key, c->media_kind, c->media_name, 0,
-                                       atomic_load(&n->duration));
-        if (!c->media_id) {
-            snprintf(c->ident_err, sizeof(c->ident_err), "%s", lib_error(n->lib));
-            return;
-        }
-        mp_verbose(n->log, "youtube identity: %s\n", c->media_key);
-        c->ident_ok = true;
+    // What comes from the network (a web page, a stream, a yt-dlp url such as a
+    // YouTube video) is never identified: no media row, nothing saved or reused.
+    if (net_media(n))
         return;
-    }
     mp_mutex_lock(&n->slock);
     char *url = talloc_strdup(c->ictx, n->url ? n->url : "");
     char *disc = n->disc_identity ? talloc_strdup(c->ictx, n->disc_identity) : NULL;
@@ -4957,19 +5048,17 @@ static void ctl_ident(struct ctl *c)
                 if (!strncmp(url, disc_urls[i], strlen(disc_urls[i]))) {
                     // A disc must be identified by its own metadata; without it
                     // nothing is reused or stored, and that is reported.
-                    snprintf(c->ident_err, sizeof(c->ident_err),
-                             "the disc could not be identified, results are not saved");
+                    NANUM_MSG(c->ident_err,
+                              N_("the disc could not be identified, results are not saved"));
                     return;
                 }
             }
-            // Network stream: no identity, the library is not consulted.
-            mp_info(n->log, "no library identity for '%.100s%s'\n", url,
-                    strlen(url) > 100 ? "..." : "");
+            // Neither a file nor a disc: no identity, the library is not consulted.
+            mp_verbose(n->log, "no library identity for this source\n");
             return;
         }
         if (!lib_fingerprint_file(path, hex, &c->media_size, err, sizeof(err))) {
-            snprintf(c->ident_err, sizeof(c->ident_err),
-                     "%s, results are not saved", err);
+            NANUM_MSG(c->ident_err, N_("%s, results are not saved"), err);
             return;
         }
         c->media_kind = "file";
@@ -5134,6 +5223,11 @@ static bool lib_act(struct ctl *c, int64_t now, bool *sel)
     default:
         d = D_DISABLE;
     }
+    // Nothing is saved, so there is nothing to use, retranslate or hold back: the
+    // live AI (and the full translation, if on) is what every action but "disable"
+    // means.
+    if (n->lib_off && d != D_DISABLE)
+        d = D_DEFAULT;
 
     mp_mutex_lock(&n->slock);
     char *url = talloc_strdup(NULL, n->url ? n->url : "");
@@ -5163,7 +5257,7 @@ static bool lib_act(struct ctl *c, int64_t now, bool *sel)
         size_t nc = 0;
         if (lib_load_cues(n->lib, NULL, f->tr_source_rev, f->tr_id, &cues, &nc, NULL)) {
             void *tmp = talloc_new(NULL);
-            char *dir = result_dir(tmp, cur);
+            char *dir = result_dir(tmp, n, cur);
             char *stem = result_stem(tmp, &c->ls, f->tr_id);
             lib_publish(n, &c->ls, LS_USING, NULL);
             publish_done(n, dir, stem, cues, nc, &c->ls, f->tr_source_rev, NULL);
@@ -5172,9 +5266,9 @@ static bool lib_act(struct ctl *c, int64_t now, bool *sel)
             mp_info(n->log, "using the saved translation (%zu lines)\n", nc);
         } else {
             char msg[256];
-            snprintf(msg, sizeof(msg), "cannot load the saved translation: %s",
-                     lib_error(n->lib));
-            mp_err(n->log, "%s\n", msg);
+            NANUM_MSG(msg, N_("cannot load the saved translation: %s"), sstr(lib_error(n->lib)));
+            char en[320];
+            mp_err(n->log, "%s\n", msg_en(msg, en, sizeof(en)));
             set_full(n, FS_ERROR, 0, "", msg);
             lib_publish(n, &c->ls, LS_ERROR, msg);
             if (set_gen_off(n, false))
@@ -5191,14 +5285,14 @@ static bool lib_act(struct ctl *c, int64_t now, bool *sel)
             char why[sizeof(n->ai_reason)];
             mp_mutex_lock(&n->slock);
             snprintf(why, sizeof(why), "%s", n->ai_reason[0] ? n->ai_reason
-                                             : "the AI engine is not available");
+                                             : msgl(N_("the AI engine is not available")));
             mp_mutex_unlock(&n->slock);
             set_full(n, FS_ERROR, 0, "", why);
             lib_publish(n, &c->ls, LS_ERROR, why);
             break;
         }
         if (!url[0]) {
-            set_full(n, FS_ERROR, 0, "", "the media has no url");
+            set_full(n, FS_ERROR, 0, "", msgl(N_("the media has no url")));
             break;
         }
         struct libsrc ls = c->ls;
@@ -5212,8 +5306,8 @@ static bool lib_act(struct ctl *c, int64_t now, bool *sel)
         c->scan = job_start(n, d == D_RETR ? JOB_RETR : JOB_SCAN, cur, url, dur,
                             atomic_load(&PRI(n)->pin_id), &ls, NULL);
         if (!c->scan) {
-            set_full(n, FS_ERROR, 0, "", "cannot start the scan thread");
-            lib_publish(n, &c->ls, LS_ERROR, "cannot start the scan thread");
+            set_full(n, FS_ERROR, 0, "", msgl(N_("cannot start the scan thread")));
+            lib_publish(n, &c->ls, LS_ERROR, msgl(N_("cannot start the scan thread")));
         }
     }
     talloc_free(url);
@@ -5230,7 +5324,7 @@ static void lib_step(struct ctl *c, int64_t now, bool *sel)
         bool have_url = n->url && n->url[0];
         mp_mutex_unlock(&n->slock);
         int64_t waited = now - c->eval_since;
-        if (!have_url && waited < MP_TIME_S_TO_NS(8))
+        if (!n->lib_off && !have_url && waited < MP_TIME_S_TO_NS(8))
             return;
         if (!c->ident_done)
             ctl_ident(c);
@@ -5240,8 +5334,8 @@ static void lib_step(struct ctl *c, int64_t now, bool *sel)
             if (!known && waited < MP_TIME_S_TO_NS(10))
                 return;     // the pinned track/subtitle is not announced yet
             if (!known)
-                snprintf(c->ident_err, sizeof(c->ident_err),
-                         "the AI input track could not be identified, results are not saved");
+                NANUM_MSG(c->ident_err,
+                          N_("the AI input track could not be identified, results are not saved"));
         }
         c->resolved = true;
         if (known && c->ident_ok) {
@@ -5273,19 +5367,37 @@ static void lib_step(struct ctl *c, int64_t now, bool *sel)
 // ---------------------------------------------------------------------------
 // Names of the virtual tracks
 
-// Korean UI names of the languages the player knows by name; others show their code.
-static const char *lang_name_ko(const char *iso1)
+// Names of the languages the player knows by name (the Korean text is the catalog key);
+// others show their code.
+static const char *lang_key(const char *iso1)
 {
     static const char *const names[][2] = {
-        {"en", "영어"}, {"ja", "일본어"}, {"ko", "한국어"}, {"zh", "중국어"},
-        {"fr", "프랑스어"}, {"de", "독일어"}, {"es", "스페인어"}, {"it", "이탈리아어"},
-        {"ru", "러시아어"}, {"pt", "포르투갈어"},
+        {"en", N_("영어")}, {"ja", N_("일본어")}, {"ko", N_("한국어")}, {"zh", N_("중국어")},
+        {"fr", N_("프랑스어")}, {"de", N_("독일어")}, {"es", N_("스페인어")},
+        {"it", N_("이탈리아어")}, {"ru", N_("러시아어")}, {"pt", N_("포르투갈어")},
     };
     for (size_t i = 0; i < MP_ARRAY_SIZE(names); i++) {
         if (!strcmp(iso1, names[i][0]))
             return names[i][1];
     }
-    return iso1;
+    return NULL;
+}
+
+// The name in the current UI language.
+static const char *lang_name(const char *iso1)
+{
+    const char *k = lang_key(iso1);
+    return k ? nanum_tr(k) : iso1;
+}
+
+// The name as an argument of a stored message (translated when the message is rendered).
+static const char *lang_arg(const char *iso1, char *buf, size_t sz)
+{
+    const char *k = lang_key(iso1);
+    if (!k)
+        return iso1;
+    snprintf(buf, sz, "\x03%s", k);
+    return buf;
 }
 
 // ISO 639-1 language the primary input reads, "" if it is not known (yet).
@@ -5313,13 +5425,22 @@ static void primary_lang(struct nanum *n, const struct rt_cfg *cur, char out[8])
     snprintf(out, 8, "%s", strcmp(l, "auto") ? l : "");
 }
 
+// The target language as shown: the default "Korean" is named in the UI language, a language
+// the user typed is shown as typed.
+static const char *title_target(struct nanum *n)
+{
+    return !strcmp(n->opts->target_language, "Korean") ? nanum_tr("한국어")
+                                                       : n->opts->target_language;
+}
+
 // "한국어 (영어 음성 기반)": target language and what the cues come from.
 static void make_title(struct nanum *n, bool audio, const char *lang, char *out, size_t sz)
 {
-    const char *target = !strcmp(n->opts->target_language, "Korean")
-                         ? "한국어" : n->opts->target_language;
-    if (lang[0])
-        snprintf(out, sz, "%s (%s %s 기반)", target, lang_name_ko(lang), audio ? "음성" : "자막");
+    const char *target = title_target(n);
+    if (lang[0] && audio)
+        snprintf(out, sz, nanum_tr("%s (%s 음성 기반)"), target, lang_name(lang));
+    else if (lang[0])
+        snprintf(out, sz, nanum_tr("%s (%s 자막 기반)"), target, lang_name(lang));
     else
         snprintf(out, sz, "%s (AI)", target);
 }
@@ -5327,22 +5448,21 @@ static void make_title(struct nanum *n, bool audio, const char *lang, char *out,
 // "한국어 (영어 디스크 자막 기반)"
 static void make_title_pgs(struct nanum *n, const char *lang, char *out, size_t sz)
 {
-    const char *target = !strcmp(n->opts->target_language, "Korean")
-                         ? "한국어" : n->opts->target_language;
-    snprintf(out, sz, "%s (%s 디스크 자막 기반)", target, lang_name_ko(lang));
+    snprintf(out, sz, nanum_tr("%s (%s 디스크 자막 기반)"), title_target(n), lang_name(lang));
 }
 
 // "한국어 (OpenSubtitles 영어 자막 기반)", or "한국어 (OpenSubtitles)" for a file that already
-// is in the target language.
+// is in the target language. The default origin "파일" is named in the UI language.
 static void make_title_import(struct nanum *n, const char *origin, const char *lang,
                               bool direct, char *out, size_t sz)
 {
-    const char *target = !strcmp(n->opts->target_language, "Korean")
-                         ? "한국어" : n->opts->target_language;
+    const char *target = title_target(n);
+    if (!strcmp(origin, "파일"))
+        origin = nanum_tr("파일");
     if (direct)
         snprintf(out, sz, "%s (%s)", target, origin);
     else
-        snprintf(out, sz, "%s (%s %s 자막 기반)", target, origin, lang_name_ko(lang));
+        snprintf(out, sz, nanum_tr("%s (%s %s 자막 기반)"), target, origin, lang_name(lang));
 }
 
 // Sets the title of the virtual track of an input. The player keeps the pointer of
@@ -5375,6 +5495,44 @@ static void set_title(struct nanum *n, int input, const char *text)
     }
 }
 
+static void build_title(struct nanum *n, const struct title_spec *t, char *out, size_t sz)
+{
+    if (t->kind == 2)
+        make_title_pgs(n, t->lang, out, sz);
+    else if (t->kind == 3)
+        make_title_import(n, t->origin, t->lang, t->direct, out, sz);
+    else
+        make_title(n, t->audio, t->lang, out, sz);
+}
+
+// Sets the title of an input's track and remembers what it is made of.
+static void title_apply(struct nanum *n, int input, const struct title_spec *t)
+{
+    char title[160];
+    mp_mutex_lock(&n->slock);
+    n->tspec[input] = *t;
+    mp_mutex_unlock(&n->slock);
+    build_title(n, t, title, sizeof(title));
+    set_title(n, input, title);
+}
+
+// The titles of the other inputs again (the UI language may have changed).
+static void titles_refresh(struct nanum *n)
+{
+    for (int i = 0; i < NANUM_INPUTS; i++) {
+        if (i == IN_PRI)
+            continue;
+        char title[160];
+        mp_mutex_lock(&n->slock);
+        struct title_spec t = n->tspec[i];
+        mp_mutex_unlock(&n->slock);
+        if (!t.kind)
+            continue;
+        build_title(n, &t, title, sizeof(title));
+        set_title(n, i, title);
+    }
+}
+
 static void ctl_titles(struct ctl *c)
 {
     struct nanum *n = c->n;
@@ -5382,6 +5540,7 @@ static void ctl_titles(struct ctl *c)
     primary_lang(n, c->cur, lang);
     make_title(n, rt_mode(c->cur) == MODE_STT, lang, title, sizeof(title));
     set_title(n, IN_PRI, title);
+    titles_refresh(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -5509,12 +5668,12 @@ static const char *sec_models_missing(struct nanum *n, const char *lang)
 {
     const struct nanum_opts *o = n->opts;
     if (!o->vad_model || !o->vad_model[0] || !mp_path_exists(o->vad_model))
-        return "The voice detection model is not installed";
+        return msgl(N_("The voice detection model is not installed"));
     bool en = !strcmp(lang, "en");
     const char *m = en ? o->stt_model : o->stt_model_multi;
     if (!m || !m[0] || !mp_path_exists(m)) {
-        return en ? "The English speech model is not installed"
-                  : "The multilingual speech model is not installed";
+        return en ? msgl(N_("The English speech model is not installed"))
+                  : msgl(N_("The multilingual speech model is not installed"));
     }
     return NULL;
 }
@@ -5553,7 +5712,7 @@ static void sec_plan(struct nanum *n, const char *prim_lang, struct sec_plan *p)
     mp_mutex_unlock(&n->slock);
 
     if (nl < 2) {
-        snprintf(p->reason, sizeof(p->reason), "the media has only one audio language");
+        snprintf(p->reason, sizeof(p->reason), "%s", msgl(N_("the media has only one audio language")));
         return;
     }
     bool orig_in_set = false;
@@ -5563,8 +5722,8 @@ static void sec_plan(struct nanum *n, const char *prim_lang, struct sec_plan *p)
     const char *want = "";
     if (orig_in_set) {
         if (!strcmp(orig, prim_lang)) {
-            snprintf(p->reason, sizeof(p->reason),
-                     "the original language is the language of the playback audio");
+            snprintf(p->reason, sizeof(p->reason), "%s",
+                     msgl(N_("the original language is the language of the playback audio")));
             return;
         }
         want = orig;
@@ -5572,13 +5731,13 @@ static void sec_plan(struct nanum *n, const char *prim_lang, struct sec_plan *p)
         want = strcmp(langs[0], prim_lang) ? langs[0] : langs[1];
     } else if (profiling && nl > 2) {
         p->pending = true;
-        snprintf(p->reason, sizeof(p->reason), "waiting for the AI profile");
+        snprintf(p->reason, sizeof(p->reason), "%s", msgl(N_("waiting for the AI profile")));
         return;
     } else {
         p->pending = !prim_lang[0] && nl == 2;
-        snprintf(p->reason, sizeof(p->reason), prim_lang[0]
-                 ? "the original language of the work is not known"
-                 : "waiting for the language of the AI input");
+        snprintf(p->reason, sizeof(p->reason), "%s", prim_lang[0]
+                 ? msgl(N_("the original language of the work is not known"))
+                 : msgl(N_("waiting for the language of the AI input")));
         return;
     }
     // Several tracks of the language: the default one, else the first.
@@ -5643,9 +5802,9 @@ static bool sec_start(struct ctl *c, const struct sec_plan *p, bool *sel)
     atomic_store(&in->bound, true);
     c->sec_id = p->id;
     snprintf(c->sec_lang, sizeof(c->sec_lang), "%s", p->lang);
-    char title[96];
-    make_title(n, true, p->lang, title, sizeof(title));
-    set_title(n, IN_SEC, title);
+    struct title_spec ts = {.kind = 1, .audio = true};
+    snprintf(ts.lang, sizeof(ts.lang), "%s", p->lang);
+    title_apply(n, IN_SEC, &ts);
     atomic_store(&n->stream_wanted[IN_SEC], true);
     // The packets the demuxer delivered since the start are kept for this stream (they are
     // not replayed); a stream that was not kept starts from what the player buffered.
@@ -5674,21 +5833,21 @@ static bool ctl_secondary_step(struct ctl *c, bool *sel)
     }
     if (atomic_load(&n->gen_off)) {
         sec_stop(c, sel);
-        sec_set(n, SS_UNAVAILABLE, "", "AI subtitles are generated from saved results or are off");
+        sec_set(n, SS_UNAVAILABLE, "", msgl(N_("AI subtitles are generated from saved results or are off")));
         return false;
     }
     if (!atomic_load(&n->ai_enabled)) {
         char why[sizeof(n->ai_reason)];
         mp_mutex_lock(&n->slock);
         snprintf(why, sizeof(why), "%s", n->ai_reason[0] ? n->ai_reason
-                                         : "the AI engine is not available");
+                                         : msgl(N_("the AI engine is not available")));
         mp_mutex_unlock(&n->slock);
         sec_stop(c, sel);
         sec_set(n, SS_UNAVAILABLE, "", why);
         return false;
     }
     if (!c->ident_done) {
-        sec_set(n, SS_WAITING, "", "waiting for the media to be identified");
+        sec_set(n, SS_WAITING, "", msgl(N_("waiting for the media to be identified")));
         return false;
     }
     char prim[8];
@@ -5709,7 +5868,7 @@ static bool ctl_secondary_step(struct ctl *c, bool *sel)
     if (atomic_load(&in->ai_failed))
         return false;                   // ai_fail() published why
     int st = atomic_load(&in->done) ? SS_DONE : sec_gate_open(n) ? SS_RUNNING : SS_WAITING;
-    sec_set(n, st, p.lang, st == SS_WAITING ? "the playback input is analysed first" : "");
+    sec_set(n, st, p.lang, st == SS_WAITING ? msgl(N_("the playback input is analysed first")) : "");
     return false;
 }
 
@@ -5772,9 +5931,9 @@ static bool pgs_start(struct ctl *c, const struct pgs_plan *p, bool *sel)
     atomic_store(&in->bound, true);
     c->pgs_id = p->id;
     snprintf(c->pgs_lang, sizeof(c->pgs_lang), "%s", p->lang);
-    char title[96];
-    make_title_pgs(n, p->lang, title, sizeof(title));
-    set_title(n, IN_PGS, title);
+    struct title_spec ts = {.kind = 2};
+    snprintf(ts.lang, sizeof(ts.lang), "%s", p->lang);
+    title_apply(n, IN_PGS, &ts);
     atomic_store(&n->stream_wanted[IN_PGS], true);
     if (!input_start(in))
         return false;
@@ -5805,7 +5964,8 @@ static void ctl_pgs(struct ctl *c, bool *sel)
     }
     if (!atomic_load(&n->ai_enabled)) {
         pgs_stop(c, sel);
-        pgs_set(n, p.exists ? SS_UNAVAILABLE : SS_OFF, "", p.exists ? "the AI engine is not available" : "");
+        pgs_set(n, p.exists ? SS_UNAVAILABLE : SS_OFF, "",
+                p.exists ? msgl(N_("the AI engine is not available")) : "");
         return;
     }
     if (!p.exists) {
@@ -5819,7 +5979,7 @@ static void ctl_pgs(struct ctl *c, bool *sel)
         return;
     }
     if (!c->ident_done) {
-        pgs_set(n, SS_WAITING, p.lang, "waiting for the media to be identified");
+        pgs_set(n, SS_WAITING, p.lang, msgl(N_("waiting for the media to be identified")));
         return;
     }
     bool running = atomic_load(&in->active);
@@ -5832,7 +5992,7 @@ static void ctl_pgs(struct ctl *c, bool *sel)
     if (atomic_load(&in->ai_failed))
         return;                         // ai_fail() published why
     int st = atomic_load(&in->done) ? SS_DONE : sec_gate_open(n) ? SS_RUNNING : SS_WAITING;
-    pgs_set(n, st, p.lang, st == SS_WAITING ? "the playback input is analysed first" : p.note);
+    pgs_set(n, st, p.lang, st == SS_WAITING ? msgl(N_("the playback input is analysed first")) : p.note);
 }
 
 // ---------------------------------------------------------------------------
@@ -6060,7 +6220,8 @@ static void prof_start(struct ctl *c, bool replace)
     char why[1024];
     struct pjob *pj = talloc_zero(NULL, struct pjob);
     if (!load_api(n, NANUM_ACCEL_CPU, &pj->eng, &pj->api, why, sizeof(why))) {
-        mp_err(n->log, "profile: %s\n", why);
+        char en[1024];
+        mp_err(n->log, "profile: %s\n", msg_en(why, en, sizeof(en)));
         set_profile(n, PS_ERROR, NULL, NULL);
         talloc_free(pj);
         return;
@@ -6088,7 +6249,10 @@ static void prof_start(struct ctl *c, bool replace)
     mp_thread_detach(t);
     c->pjob = pj;
     set_profile(n, PS_RUNNING, NULL, NULL);
-    mp_info(n->log, "profile: asking about '%s' (audio: %s)\n", pj->title, pj->langs);
+    if (net_media(n))
+        mp_info(n->log, "profile: asking about the work (audio: %s)\n", pj->langs);
+    else
+        mp_info(n->log, "profile: asking about '%s' (audio: %s)\n", pj->title, pj->langs);
 }
 
 // ISO 639-1 from whatever the model answered ("ja", "jpn", "Japanese").
@@ -6164,8 +6328,12 @@ static void prof_finish(struct ctl *c, struct pjob *pj)
         lib_prop_set(n->lib, c->media_id, prop_key(tmp, "glossary", target), glossary);
         lib_prop_set(n->lib, c->media_id, k, "1");
     }
-    mp_info(n->log, "profile: work '%s', original language '%s', %d glossary entries\n", work,
-            orig, glossary_lines(glossary));
+    if (net_media(n))
+        mp_info(n->log, "profile: original language '%s', %d glossary entries\n", orig,
+                glossary_lines(glossary));
+    else
+        mp_info(n->log, "profile: work '%s', original language '%s', %d glossary entries\n",
+                work, orig, glossary_lines(glossary));
     talloc_free(tmp);
 }
 
@@ -6174,6 +6342,13 @@ static void prof_load(struct ctl *c)
 {
     struct nanum *n = c->n;
     c->prof_loaded = true;
+    if (n->lib_off) {
+        // Nothing is saved: the work is identified again for every media, in memory.
+        gloss_set_base(n);
+        set_profile(n, n->tr_enabled ? PS_RUNNING : PS_OFF, "", "");
+        prof_start(c, false);
+        return;
+    }
     if (!c->ident_ok || !n->lib) {
         set_profile(n, PS_OFF, "", "");
         gloss_set_base(n);
@@ -6544,7 +6719,7 @@ static const char *gloss_translate(struct job *j, struct gl_set *s, size_t *done
         .translate_endpoint = n->opts->tr_endpoint,
         .translate_model = n->opts->tr_model,
         .target_language = n->opts->target_language,
-        .cache_path = n->opts->cache,
+        .cache_path = net_media(n) ? NULL : n->opts->cache,
         .translate_only = 1,
         .translate_style = ts.style,
         .translate_style_text = ts.style_text,
@@ -6552,8 +6727,8 @@ static const char *gloss_translate(struct job *j, struct gl_set *s, size_t *done
     };
     struct nanum_ai *ai = j->api.create(&cfg, gloss_event_cb, &cb);
     if (!ai) {
-        snprintf(j->gl_err, sizeof(j->gl_err), "cannot start the translation engine: %s",
-                 j->api.last_error());
+        NANUM_MSG(j->gl_err, N_("cannot start the translation engine: %s"),
+                  sstr(j->api.last_error()));
         talloc_free(tmp);
         return j->gl_err;
     }
@@ -6613,7 +6788,7 @@ static const char *gloss_translate(struct job *j, struct gl_set *s, size_t *done
     }
     const char *err = NULL;
     if (!job_cancelled(j) && attempted && !delivered)
-        err = "the translation model did not answer";
+        err = msgl(N_("the translation model did not answer"));
     j->api.cancel_full(ai);
     j->api.destroy(ai);
     talloc_free(tmp);
@@ -6668,7 +6843,7 @@ static void gloss_apply_full(struct job *j, struct gl_set *s, int *changed)
             if (!tr_id)
                 mp_err(n->log, "cannot save the translation: %s\n", lib_error(n->lib));
         }
-        char *dir = result_dir(tmp, j->cfg);
+        char *dir = result_dir(tmp, j->n, j->cfg);
         char *stem = result_stem(tmp, &ls, tr_id);
         if (ls.save && tr_id)
             lib_publish(n, &ls, LS_USING, NULL);
@@ -6689,7 +6864,8 @@ static void gloss_run(struct job *j)
     int changed = 0;
     bool any = false;
     if (!load_api(n, NANUM_ACCEL_CPU, &j->eng, &j->api, why, sizeof(why))) {
-        mp_err(n->log, "glossary: %s\n", why);
+        char en[1024];
+        mp_err(n->log, "glossary: %s\n", msg_en(why, en, sizeof(en)));
         gl_set_state(n, GS_ERROR, 0, 0, why);
         goto out;
     }
@@ -6738,7 +6914,8 @@ static void gloss_run(struct job *j)
     if (job_cancelled(j))
         goto out;
     if (err) {
-        mp_err(n->log, "glossary: %s\n", err);
+        char en[1024];
+        mp_err(n->log, "glossary: %s\n", msg_en(err, en, sizeof(en)));
         gl_set_state(n, GS_ERROR, 0, changed, err);
         goto out;
     }
@@ -7067,10 +7244,10 @@ static void imp_run(struct job *j)
     char *tmpfile = NULL;
     char errbuf[320] = "";
 
-    imp_set(n, IS_TRANSLATING, 0, "", "자막을 읽는 중");
+    imp_set(n, IS_TRANSLATING, 0, "", msgl(N_("자막을 읽는 중")));
     FILE *f = fopen(j->imp_path, "rb");
     if (!f) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "cannot open the subtitle file");
+        NANUM_MSG(j->imp_err, N_("cannot open the subtitle file"));
         goto out;
     }
     fseeko(f, 0, SEEK_END);
@@ -7078,14 +7255,14 @@ static void imp_run(struct job *j)
     fseeko(f, 0, SEEK_SET);
     if (size <= 0 || size > 32 * 1024 * 1024) {
         fclose(f);
-        snprintf(j->imp_err, sizeof(j->imp_err), "the subtitle file is empty or too large");
+        NANUM_MSG(j->imp_err, N_("the subtitle file is empty or too large"));
         goto out;
     }
     unsigned char *raw = talloc_array(tmp, unsigned char, size);
     size_t got = fread(raw, 1, size, f);
     fclose(f);
     if (got != (size_t)size) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "cannot read the subtitle file");
+        NANUM_MSG(j->imp_err, N_("cannot read the subtitle file"));
         goto out;
     }
     char hex[65];
@@ -7093,7 +7270,7 @@ static void imp_run(struct job *j)
     snprintf(j->imp_hash, sizeof(j->imp_hash), "%.16s", hex);
     char *text = decode_text(tmp, raw, size, j->imp_enc);
     if (!text) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "cannot decode the subtitle file");
+        NANUM_MSG(j->imp_err, N_("cannot decode the subtitle file"));
         goto out;
     }
 
@@ -7101,14 +7278,18 @@ static void imp_run(struct job *j)
     const char *ext = strrchr(j->imp_path, '.');
     if (!ext || strlen(ext) > 8 || strpbrk(ext, "/\\"))
         ext = ".srt";
-    const char *tdir = getenv("TEMP");
-    tmpfile = talloc_asprintf(NULL, "%s/nanum-import-%lld%s", tdir && tdir[0] ? tdir : ".",
+    char *tdir = nanum_private_dir(tmp);
+    if (!tdir) {
+        NANUM_MSG(j->imp_err, N_("cannot create the temporary folder"));
+        goto out;
+    }
+    tmpfile = talloc_asprintf(NULL, "%s/import-%lld%s", tdir,
                               (long long)(mp_time_ns() / 1000), ext);
     FILE *tf = fopen(tmpfile, "wb");
     if (!tf || fwrite(text, 1, strlen(text), tf) != strlen(text)) {
         if (tf)
             fclose(tf);
-        snprintf(j->imp_err, sizeof(j->imp_err), "cannot write the temporary subtitle file");
+        NANUM_MSG(j->imp_err, N_("cannot write the temporary subtitle file"));
         goto out;
     }
     fclose(tf);
@@ -7117,7 +7298,9 @@ static void imp_run(struct job *j)
     j->cfg->sub_id = -1;
     const char *err = open_source(j, tmpfile, false, true, &d, &sh);
     if (err) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "%s: this is not a subtitle file the player can read", err);
+        char r[160];
+        nanum_msg_render(err, r, sizeof(r));
+        NANUM_MSG(j->imp_err, N_("%s: this is not a subtitle file the player can read"), r);
         goto out;
     }
     struct lib_cue *cues = NULL;
@@ -7149,7 +7332,7 @@ static void imp_run(struct job *j)
     if (job_cancelled(j))
         goto out;
     if (!nc) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "the subtitle file has no text");
+        NANUM_MSG(j->imp_err, N_("the subtitle file has no text"));
         goto out;
     }
     qsort(cues, nc, sizeof(*cues), cmp_cue);
@@ -7205,14 +7388,14 @@ static void imp_run(struct job *j)
     };
     ai = j->api.create(&cfg, scan_event_cb, j);
     if (!ai) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "cannot start the translation engine: %s",
-                 j->api.last_error());
+        NANUM_MSG(j->imp_err, N_("cannot start the translation engine: %s"),
+                  sstr(j->api.last_error()));
         goto out;
     }
     for (size_t i = 0; i < nc; i++)
         j->api.push_text(ai, cues[i].pts, cues[i].dur, cues[i].src);
     if (j->api.transcript_size(ai) == 0) {
-        snprintf(j->imp_err, sizeof(j->imp_err), "the subtitle file has nothing to translate");
+        NANUM_MSG(j->imp_err, N_("the subtitle file has nothing to translate"));
         goto out;
     }
     int r = job_translate(j, ai, errbuf, sizeof(errbuf));
@@ -7486,12 +7669,13 @@ static void imp_retransform(struct nanum *n, double old_scale, double off, doubl
 static void imp_show_track(struct ctl *c)
 {
     struct nanum *n = c->n;
-    char title[160];
-    make_title_import(n, c->imp.origin, c->imp.lang, c->imp.direct, title, sizeof(title));
+    struct title_spec ts = {.kind = 3, .direct = c->imp.direct};
+    snprintf(ts.lang, sizeof(ts.lang), "%s", c->imp.lang);
+    snprintf(ts.origin, sizeof(ts.origin), "%s", c->imp.origin);
     mp_mutex_lock(&n->slock);
     snprintf(IMPT(n)->lang, sizeof(IMPT(n)->lang), "%s", c->imp.lang);
     mp_mutex_unlock(&n->slock);
-    set_title(n, IN_IMP, title);
+    title_apply(n, IN_IMP, &ts);
     atomic_store(&n->stream_wanted[IN_IMP], true);
     wake_demux(n);
 }
@@ -7567,18 +7751,21 @@ static void imp_try_place(struct ctl *c, int64_t now)
     if (dead || waited > 150) {
         char note[256];
         if (f.ok) {
-            snprintf(note, sizeof(note), "정렬 신뢰도가 낮습니다 (%.0f%%)", f.conf * 100);
+            char pct[16];
+            snprintf(pct, sizeof(pct), "%.0f", f.conf * 100);
+            NANUM_MSG(note, N_("정렬 신뢰도가 낮습니다 (%s%%)"), pct);
             imp_place(c, &f, false, note, na);
         } else {
-            snprintf(note, sizeof(note), na < IMP_MIN_REF
-                     ? "음성 인식 자막이 부족해 정렬하지 못했습니다: 시간 이동 0초 유지"
-                     : "정렬 신뢰도가 낮아 시간 이동 0초를 유지합니다");
+            if (na < IMP_MIN_REF)
+                NANUM_MSG(note, N_("음성 인식 자막이 부족해 정렬하지 못했습니다: 시간 이동 0초 유지"));
+            else
+                NANUM_MSG(note, N_("정렬 신뢰도가 낮아 시간 이동 0초를 유지합니다"));
             struct fit none = {.scale = 1, .conf = f.conf, .matched = f.matched};
             imp_place(c, &none, true, note, na);
         }
         return;
     }
-    imp_set(n, IS_ALIGNING, MPMIN(0.95, na / 24.0), "", "음성 인식 자막과 시간 맞추는 중");
+    imp_set(n, IS_ALIGNING, MPMIN(0.95, na / 24.0), "", msgl(N_("음성 인식 자막과 시간 맞추는 중")));
 }
 
 // More reference cues than at the last fit: a better alignment replaces a weak one.
@@ -7621,7 +7808,7 @@ static void imp_refine(struct ctl *c)
     mp_mutex_unlock(&n->slock);
     imp_retransform(n, old_scale, f.offset, f.scale);
     imp_persist_props(c);
-    imp_publish(c, f.conf >= IMP_GOOD_CONF ? "" : "정렬 신뢰도가 낮습니다");
+    imp_publish(c, f.conf >= IMP_GOOD_CONF ? "" : msgl(N_("정렬 신뢰도가 낮습니다")));
     mp_info(n->log, "import realigned: offset %.2f s, scale %.5f, confidence %.2f\n", f.offset,
             f.scale, f.conf);
 }
@@ -7684,7 +7871,7 @@ static void imp_load_saved(struct ctl *c)
     in->media_id = c->media_id;
     in->persist = in->key != NULL;
     imp_show_track(c);
-    imp_publish(c, low ? "정렬 신뢰도가 낮아 시간 이동 0초를 유지합니다" : "");
+    imp_publish(c, low ? msgl(N_("정렬 신뢰도가 낮아 시간 이동 0초를 유지합니다")) : "");
     mp_mutex_lock(&n->slock);
     n->imp_state = IS_DONE;
     n->imp_progress = 1.0;
@@ -7702,7 +7889,8 @@ static void imp_absorb(struct ctl *c, struct job *j, int64_t now)
     if (job_cancelled(j))
         return;
     if (j->imp_err[0]) {
-        mp_err(n->log, "import: %s\n", j->imp_err);
+        char en[320];
+        mp_err(n->log, "import: %s\n", msg_en(j->imp_err, en, sizeof(en)));
         imp_set(n, IS_ERROR, 0, j->imp_err, "");
         return;
     }
@@ -7728,7 +7916,7 @@ static void imp_absorb(struct ctl *c, struct job *j, int64_t now)
     n->imp_lines = (int)j->nimp;
     mp_mutex_unlock(&n->slock);
     imp_publish(c, NULL);
-    imp_set(n, IS_ALIGNING, 0, "", "음성 인식 자막과 시간 맞추는 중");
+    imp_set(n, IS_ALIGNING, 0, "", msgl(N_("음성 인식 자막과 시간 맞추는 중")));
     // The glossary the translation extracted is kept with the media.
     if (n->lib && c->ident_ok) {
         mp_mutex_lock(&n->slock);
@@ -7760,13 +7948,13 @@ static void ctl_import(struct ctl *c, int64_t now)
         c->imp.ctx = NULL;
         c->imp.cues = NULL;
         if (!mp_path_exists(path)) {
-            imp_set(n, IS_ERROR, 0, "the subtitle file does not exist", "");
+            imp_set(n, IS_ERROR, 0, msgl(N_("the subtitle file does not exist")), "");
             mp_err(n->log, "import: '%s' does not exist\n", path);
         } else {
             imp_set(n, IS_TRANSLATING, 0, "", "");
             c->ijob = job_start(n, JOB_IMPORT, c->cur, "", 0, -1, NULL, req);
             if (!c->ijob)
-                imp_set(n, IS_ERROR, 0, "cannot start the import thread", "");
+                imp_set(n, IS_ERROR, 0, msgl(N_("cannot start the import thread")), "");
             else
                 mp_info(n->log, "import: '%s' (%s)\n", path, origin);
         }
@@ -7849,7 +8037,7 @@ static void ctl_gloss(struct ctl *c)
         gl_set_state(n, GS_RUNNING, 0, 0, "");
         c->gjob = job_start(n, JOB_GLOSS, c->cur, "", 0, -1, NULL, cur);
         if (!c->gjob)
-            gl_set_state(n, GS_ERROR, 0, 0, "cannot start the glossary thread");
+            gl_set_state(n, GS_ERROR, 0, 0, msgl(N_("cannot start the glossary thread")));
     }
     talloc_free(cur);
 }
@@ -7876,11 +8064,16 @@ static MP_THREAD_VOID ctl_thread(void *p)
                     .sec_id = -1, .next_save = mp_time_ns() + MP_TIME_S_TO_NS(SAVE_INTERVAL_S)};
     bool first = true;
 
-    char err[256] = "";
-    n->lib = lib_open(n->opts->lib_db, err, sizeof(err));
-    if (!n->lib) {
-        mp_err(n->log, "media library unavailable: %s\n", err);
-        snprintf(n->lib_open_err, sizeof(n->lib_open_err), "%s", err);
+    // The media library is the only thing the engine keeps about the media it
+    // worked on, and it is opt-in: --nanum-library-db=<file>. Without it every
+    // result lives in memory (and the transient session folder) of this file.
+    if (!n->lib_off) {
+        char err[256] = "";
+        n->lib = lib_open(n->opts->lib_db, err, sizeof(err));
+        if (!n->lib) {
+            mp_err(n->log, "media library unavailable: %s\n", err);
+            snprintf(n->lib_open_err, sizeof(n->lib_open_err), "%s", err);
+        }
     }
     set_lib(n, LS_LOADING, "", "", false, false, "", "");
 
@@ -8075,7 +8268,9 @@ static void nanum_destroy(void *p)
 }
 
 #ifdef _WIN32
-// Minidump on unhandled exceptions. Unlike WER LocalDumps this needs no admin
+// Minidump on unhandled exceptions, only when NANUMPLAYER_CRASH_DUMP_DIR names a
+// folder (a dump holds the memory of the process: media addresses, cookies, ...,
+// so none is ever written by default). Unlike WER LocalDumps this needs no admin
 // rights. Heap corruption (0xC0000374) is a fast-fail and bypasses it.
 static wchar_t crash_dir[MAX_PATH];
 static LPTOP_LEVEL_EXCEPTION_FILTER prev_filter;
@@ -8118,13 +8313,10 @@ static void install_crash_handler(struct nanum *n)
     if (done)
         return;
     done = true;
-    wchar_t base[MAX_PATH];
-    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    DWORD len = GetEnvironmentVariableW(L"NANUMPLAYER_CRASH_DUMP_DIR", crash_dir,
+                                        MAX_PATH);
     if (!len || len >= MAX_PATH)
         return;
-    swprintf(crash_dir, MAX_PATH, L"%ls\\NanumPlayer", base);
-    CreateDirectoryW(crash_dir, NULL);
-    swprintf(crash_dir, MAX_PATH, L"%ls\\NanumPlayer\\dumps", base);
     CreateDirectoryW(crash_dir, NULL);
     prev_filter = SetUnhandledExceptionFilter(crash_filter);
     mp_verbose(n->log, "crash dumps go to %ls\n", crash_dir);
@@ -8166,14 +8358,17 @@ struct nanum *nanum_create(void *parent, struct mpv_global *global,
     n->log = mp_log_new(n, log, "nanum");
     n->global = global;
     n->opts = talloc_steal(n, opts);
+    // What the previous media left in the transient folder is of no use anymore.
+    nanum_private_clear();
     n->tr_enabled = n->opts->tr_endpoint && n->opts->tr_endpoint[0];
     atomic_store(&n->playhead, MP_NOPTS_VALUE);
     atomic_store(&n->duration, -1.0);
     atomic_store(&n->ts_offset, 0.0);
-    n->lstate = LS_LOADING;
+    n->lib_off = !n->opts->lib_db || !n->opts->lib_db[0];
+    n->lstate = n->lib_off ? LS_DISABLED : LS_LOADING;
     n->glossary = strdup("");
     n->style_text = strdup("");
-    snprintf(n->sec_reason, sizeof(n->sec_reason), "waiting for the media to be identified");
+    NANUM_MSG(n->sec_reason, N_("waiting for the media to be identified"));
     n->sec_state = SS_WAITING;
     n->pgs_state = SS_OFF;
     n->imp_state = IS_OFF;

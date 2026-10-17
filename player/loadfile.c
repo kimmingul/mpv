@@ -48,6 +48,7 @@
 #include "input/input.h"
 #include "misc/json.h"
 #include "misc/language.h"
+#include "misc/path_utils.h"
 
 #include "audio/out/ao.h"
 #include "filters/f_decoder_wrapper.h"
@@ -1712,7 +1713,7 @@ static void load_external_opts(struct MPContext *mpctx)
 
 static void append_to_watch_history(struct MPContext *mpctx)
 {
-    if (!mpctx->opts->save_watch_history)
+    if (!mpctx->opts->save_watch_history || mp_is_network_entry(mpctx->filename))
         return;
 
     void *ctx = talloc_new(NULL);

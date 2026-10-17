@@ -96,18 +96,6 @@ struct mp_log_root {
     // --- protected by log_file_lock
     bool log_file_thread_active; // also termination signal for the thread
     int module_indent;
-    // --- NanumPlayer file-log policy. Set by mp_msg_set_log_policy() before
-    // the log file is opened; read-only while log_file_thread runs. It only
-    // applies to the log file whose path equals policy_path.
-    char *policy_path;
-    int policy_level;           // highest level written outside diagnostics
-    char *policy_modules[8];    // diagnostics: these modules also down to debug
-    int policy_max_bytes;       // size at which the file rotates, 0: no limit
-    int policy_keep;            // older generations kept (open and rotation)
-    bool log_file_filtered;     // policy applies to the open log file
-    char *log_file_path;        // copy of log_path for the thread (rotation)
-    atomic_bool log_file_diag;  // diagnostics are on
-    int64_t log_file_bytes;     // written to the open file (thread only)
 };
 
 struct mp_log {
@@ -770,63 +758,6 @@ void mp_msg_init(struct mpv_global *global)
     global->log = log;
 }
 
-// Generation names: <stem>.<n><ext>, e.g. last-playback.log -> last-playback.1.log
-static char *log_generation(const char *path, int n)
-{
-    const char *sep = strrchr(path, '/');
-    const char *sep2 = strrchr(path, '\\');
-    if (sep2 > sep)
-        sep = sep2;
-    const char *dot = strrchr(path, '.');
-    if (!dot || (sep && dot < sep))
-        dot = path + strlen(path);
-    return talloc_asprintf(NULL, "%.*s.%d%s", (int)(dot - path), path, n, dot);
-}
-
-// Shift the previous generations up by one and move the file at path to
-// generation 1. A file that cannot be moved (open in another instance) is left
-// alone; the caller truncates it as it always did.
-static void rotate_log_files(const char *path, int keep)
-{
-    for (int n = keep; n >= 1; n--) {
-        char *from = n > 1 ? log_generation(path, n - 1) : talloc_strdup(NULL, path);
-        char *to = log_generation(path, n);
-        unlink(to);
-        rename(from, to);
-        talloc_free(from);
-        talloc_free(to);
-    }
-}
-
-static bool log_file_wanted(struct mp_log_root *root, struct mp_log_buffer_entry *e)
-{
-    if (!root->log_file_filtered || e->level <= root->policy_level)
-        return true;
-    if (!atomic_load(&root->log_file_diag) || e->level > MSGL_DEBUG)
-        return false;
-    for (int n = 0; n < MP_ARRAY_SIZE(root->policy_modules) && root->policy_modules[n]; n++) {
-        if (match_mod(e->prefix, root->policy_modules[n]))
-            return true;
-    }
-    return false;
-}
-
-// The file reached its size limit: keep it as generation 1 and start a new one.
-static void log_file_rotate(struct mp_log_root *root)
-{
-    fclose(root->log_file);
-    root->log_file = NULL;
-    rotate_log_files(root->log_file_path, root->policy_keep);
-    root->log_file = fopen(root->log_file_path, "wb");
-    root->log_file_bytes = 0;
-    if (root->log_file) {
-        int n = fprintf(root->log_file, "[%8.3f][i][global] log continues here, "
-                        "the previous part is the .1 file next to this one\n",
-                        mp_time_sec());
-        root->log_file_bytes = n > 0 ? n : 0;
-    }
-}
-
 static MP_THREAD_VOID log_file_thread(void *p)
 {
     struct mp_log_root *root = p;
@@ -840,16 +771,10 @@ static MP_THREAD_VOID log_file_thread(void *p)
             mp_msg_log_buffer_read(root->log_file_buffer);
         if (e) {
             mp_mutex_unlock(&root->log_file_lock);
-            if (root->log_file && log_file_wanted(root, e)) {
-                int n = fprintf(root->log_file, "[%8.3f][%c][%s] %s",
-                                mp_time_sec(),
-                                mp_log_levels[e->level][0], e->prefix, e->text);
+            if (root->log_file) {
+                fprintf(root->log_file, "[%8.3f][%c][%s] %s", mp_time_sec(),
+                        mp_log_levels[e->level][0], e->prefix, e->text);
                 fflush(root->log_file);
-                if (n > 0)
-                    root->log_file_bytes += n;
-                if (root->log_file_filtered && root->policy_max_bytes > 0 &&
-                    root->log_file_bytes >= root->policy_max_bytes)
-                    log_file_rotate(root);
             }
             mp_mutex_lock(&root->log_file_lock);
             talloc_free(e);
@@ -896,9 +821,6 @@ static void terminate_log_file_thread(struct mp_log_root *root)
     if (root->log_file)
         fclose(root->log_file);
     root->log_file = NULL;
-    talloc_free(root->log_file_path);
-    root->log_file_path = NULL;
-    root->log_file_filtered = false;
 }
 
 // If opt is different from *current_path, update *current_path and return true.
@@ -956,12 +878,6 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
     if (check_new_path(global, opts->log_file, &root->log_path)) {
         terminate_log_file_thread(root);
         if (root->log_path) {
-            root->log_file_filtered = root->policy_path &&
-                                      !strcmp(root->policy_path, root->log_path);
-            root->log_file_bytes = 0;
-            // The previous session's log is kept (bounded), not truncated.
-            if (root->log_file_filtered && root->policy_keep > 0)
-                rotate_log_files(root->log_path, root->policy_keep);
             root->log_file = fopen(root->log_path, "wb");
             if (root->log_file) {
 
@@ -982,19 +898,13 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
                     // note: new messages while iterating are still flushed.
                     struct mp_log_buffer_entry *e;
                     while ((e = mp_msg_log_buffer_read(earlybuf))) {
-                        if (log_file_wanted(root, e)) {
-                            int n = fprintf(root->log_file, "[%8.3f][%c][%s] %s",
-                                            0.0, mp_log_levels[e->level][0],
-                                            e->prefix, e->text);
-                            if (n > 0)
-                                root->log_file_bytes += n;
-                        }
+                        fprintf(root->log_file, "[%8.3f][%c][%s] %s", 0.0,
+                                mp_log_levels[e->level][0], e->prefix, e->text);
                         talloc_free(e);
                     }
                     mp_msg_log_buffer_destroy(earlybuf);  // + remove from root
                 }
 
-                root->log_file_path = talloc_strdup(NULL, root->log_path);
                 root->log_file_buffer =
                     mp_msg_log_buffer_new(global, FILE_BUF, MP_LOG_BUFFER_MSGL_LOGFILE,
                                           wakeup_log_file, root);
@@ -1032,43 +942,6 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
     }
 }
 
-// NanumPlayer: bound the log file `path` (the application's own default file;
-// any other --log-file keeps mpv's behavior: truncated, everything at debug).
-// - Messages above `level` are not written, except while diagnostics are on
-//   (mp_msg_set_log_diagnostics()): then the comma separated `modules` (prefix
-//   match, like --msg-level) are written down to debug.
-// - At open, the previous file is kept as generation 1..keep (<stem>.<n><ext>).
-// - A file reaching max_bytes becomes generation 1 and a new one is started.
-// Must be called before the log file is opened; main thread only.
-void mp_msg_set_log_policy(struct mpv_global *global, const char *path, int level,
-                           const char *modules, int max_bytes, int keep)
-{
-    struct mp_log_root *root = global->log->root;
-
-    talloc_free(root->policy_path);
-    root->policy_path = path ? talloc_strdup(NULL, path) : NULL;
-    root->policy_level = level;
-    root->policy_max_bytes = max_bytes;
-    root->policy_keep = MPMAX(keep, 0);
-    for (int n = 0; n < MP_ARRAY_SIZE(root->policy_modules); n++) {
-        talloc_free(root->policy_modules[n]);
-        root->policy_modules[n] = NULL;
-    }
-    int n = 0;
-    while (modules && modules[0] && n < MP_ARRAY_SIZE(root->policy_modules)) {
-        size_t len = strcspn(modules, ",");
-        if (len)
-            root->policy_modules[n++] = talloc_strndup(NULL, modules, len);
-        modules += len + (modules[len] == ',');
-    }
-}
-
-// Diagnostics on/off for the policy above. Any thread.
-void mp_msg_set_log_diagnostics(struct mpv_global *global, bool on)
-{
-    atomic_store(&global->log->root->log_file_diag, on);
-}
-
 void mp_msg_force_stderr(struct mpv_global *global, bool force_stderr)
 {
     struct mp_log_root *root = global->log->root;
@@ -1100,9 +973,6 @@ void mp_msg_uninit(struct mpv_global *global)
         fclose(root->stats_file);
     talloc_free(root->stats_path);
     talloc_free(root->log_path);
-    talloc_free(root->policy_path);
-    for (int n = 0; n < MP_ARRAY_SIZE(root->policy_modules); n++)
-        talloc_free(root->policy_modules[n]);
     m_option_type_msglevels.free(&root->msg_levels);
     mp_mutex_destroy(&root->lock);
     mp_mutex_destroy(&root->log_file_lock);

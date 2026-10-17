@@ -57,5 +57,6 @@ bool mp_path_isdir(const char *path);
 bool mp_is_url(bstr path);
 
 bstr mp_split_proto(bstr path, bstr *out_url);
+bool mp_is_network_entry(const char *path);
 
 void mp_mkdirp(const char *dir);
