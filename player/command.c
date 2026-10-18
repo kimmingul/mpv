@@ -89,6 +89,7 @@
 #include "osdep/nanum-accel.h"
 #include "osdep/nanum-diag.h"
 #include "osdep/nanum-disc.h"
+#include "osdep/nanum-generate.h"
 #include "nanum/i18n.h"
 
 #include "core.h"
@@ -7245,6 +7246,19 @@ static void cmd_nanum_disc_rip(void *p)
                    cmd->args[3].v.s);
 }
 
+// NanumPlayer: playback-free subtitle generation (osdep/nanum-generate-win.c). Runs on a command
+// worker thread and is abortable; the structured result is in cmd->result and the progress is
+// published as user-data/nanum/generate.
+static void cmd_nanum_generate(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+#ifdef _WIN32
+    nanum_generate_command(cmd, cmd->args[0].v.s);
+#else
+    cmd->success = false;
+#endif
+}
+
 static void cmd_filter(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8181,6 +8195,11 @@ const struct mp_cmd_def mp_cmds[] = {
             {"destination", OPT_STRING(v.s)},
             {"expected_disc_id", OPT_STRING(v.s), OPTDEF_STR(""), .flags = MP_CMD_OPT_ARG},
         },
+        .spawn_thread = true,
+        .can_abort = true,
+    },
+    { "nanum-generate", cmd_nanum_generate,
+        { {"spec", OPT_STRING(v.s)} },
         .spawn_thread = true,
         .can_abort = true,
     },

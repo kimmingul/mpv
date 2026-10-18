@@ -41,9 +41,9 @@ static const char DEFAULT_CONF[] =
     "# Paths of the engine/models are set by NanumPlayer.exe and need not be set here.\n"
     "demuxer-readahead-secs=120\n"
     "demuxer-max-bytes=1500MiB\n"
-    "slang=kor\n"
     "# nanum-translate-endpoint=http://127.0.0.1:11434\n"
     "# nanum-translate-model=gemma4:latest\n"
+    "# Language of the AI subtitles; default: your Windows display language. Ctrl+N changes it too.\n"
     "# nanum-target-language=Korean\n"
     "# Blu-ray: set the drive, e.g.  bluray-device=E:\n";
 
@@ -145,6 +145,65 @@ static char *settings_dir(void *ctx, struct mpv_global *global, bool *configured
     return r;
 }
 
+// The Windows display language as the translation model is told its name (nanum-target-language). The
+// first of the user's preferred display languages, else the default UI language of the account;
+// English when the language is not in the list.
+static void os_language(char code[8], char *name, size_t name_size)
+{
+    static const struct { const char *code, *name; } langs[] = {
+        {"ko", "Korean"}, {"en", "English"}, {"ja", "Japanese"}, {"es", "Spanish"}, {"fr", "French"},
+        {"de", "German"}, {"it", "Italian"}, {"pt", "Portuguese"}, {"ru", "Russian"}, {"ar", "Arabic"},
+        {"hi", "Hindi"}, {"th", "Thai"}, {"vi", "Vietnamese"}, {"id", "Indonesian"}, {"ms", "Malay"},
+        {"fil", "Filipino"}, {"tl", "Filipino"}, {"bn", "Bengali"}, {"nl", "Dutch"}, {"pl", "Polish"},
+        {"tr", "Turkish"}, {"sv", "Swedish"}, {"da", "Danish"}, {"nb", "Norwegian"}, {"nn", "Norwegian"},
+        {"no", "Norwegian"}, {"fi", "Finnish"}, {"cs", "Czech"}, {"el", "Greek"}, {"he", "Hebrew"},
+        {"hu", "Hungarian"}, {"ro", "Romanian"}, {"uk", "Ukrainian"}, {"fa", "Persian"},
+    };
+    char tag[64] = "";
+    ULONG count = 0, size = 0;
+    if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, NULL, &size) && size) {
+        wchar_t *list = calloc(size, sizeof(wchar_t));
+        if (list && GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, list, &size) && count > 0)
+            WideCharToMultiByte(CP_UTF8, 0, list, -1, tag, sizeof(tag), NULL, NULL);
+        free(list);
+    }
+    if (!tag[0]) {
+        wchar_t wname[LOCALE_NAME_MAX_LENGTH];
+        if (LCIDToLocaleName(GetUserDefaultUILanguage(), wname, MP_ARRAY_SIZE(wname), 0))
+            WideCharToMultiByte(CP_UTF8, 0, wname, -1, tag, sizeof(tag), NULL, NULL);
+    }
+    // "zh-Hant-TW" / "ko-KR": primary subtag lower-case, the rest upper-cased for the script / region test
+    char primary[8] = "";
+    size_t n = 0;
+    while (tag[n] && tag[n] != '-' && tag[n] != '_' && n < sizeof(primary) - 1) {
+        primary[n] = (char)(tag[n] >= 'A' && tag[n] <= 'Z' ? tag[n] + 32 : tag[n]);
+        n++;
+    }
+    primary[n] = 0;
+    const char *lang = "English";
+    const char *iso = "en";
+    if (!strcmp(primary, "zh")) {
+        char rest[64];
+        snprintf(rest, sizeof(rest), "%s", tag + n);
+        for (char *p = rest; *p; p++)
+            *p = (char)(*p >= 'a' && *p <= 'z' ? *p - 32 : *p);
+        bool traditional = strstr(rest, "HANT") || strstr(rest, "-TW") || strstr(rest, "-HK") ||
+                           strstr(rest, "-MO");
+        lang = traditional ? "Traditional Chinese" : "Simplified Chinese";
+        iso = "zh";
+    } else {
+        for (size_t i = 0; i < MP_ARRAY_SIZE(langs); i++) {
+            if (!strcmp(primary, langs[i].code)) {
+                lang = langs[i].name;
+                iso = langs[i].code;
+                break;
+            }
+        }
+    }
+    snprintf(code, 8, "%s", iso);
+    snprintf(name, name_size, "%s", lang);
+}
+
 static void create_default_conf(const char *dir)
 {
     char *path = talloc_asprintf(NULL, "%s\\mpv.conf", dir);
@@ -227,8 +286,16 @@ void nanum_startup_defaults(struct MPContext *mpctx)
     add_opt(&text, "gpu-shader-cache", "no");
     add_opt(&text, "icc-cache", "no");
     add_opt(&text, "ytdl-raw-options-append", "no-cache-dir=");
+    // Uploader subtitles only (no write-auto-subs): ytdl_hook adds them as external tracks, the subtitle list
+    // shows them as originals; automatic captions are never fetched.
+    add_opt(&text, "ytdl-raw-options-append", "write-subs=");
     // The disc diagnostics (explicit, see nanum-diag.h) are the only log written.
     nanum_diag_startup(mpctx, settings);
+    // The language the AI subtitles are made in: the Windows display language (mpv.conf, the command line and
+    // the choice saved by the player's menu still override it).
+    char os_code[8], os_name[48];
+    os_language(os_code, os_name, sizeof(os_name));
+    add_opt(&text, "nanum-target-language", os_name);
 
     // Same level as mpv's built-in profile defaults: below mpv.conf and the
     // command line.
@@ -316,6 +383,15 @@ void nanum_startup_scripts(struct MPContext *mpctx)
     nanum_accel_refresh(mpctx);
     nanum_youtube_publish(mpctx);
     nanum_diag_publish(mpctx);
+    {
+        // The Windows display language as the model names it, for the player's language menu ("automatic").
+        char os_code[8], os_name[48];
+        os_language(os_code, os_name, sizeof(os_name));
+        mpv_node code = {.format = MPV_FORMAT_STRING, .u.string = os_code};
+        mpv_node name = {.format = MPV_FORMAT_STRING, .u.string = os_name};
+        mp_property_do("user-data/nanum/os-language", M_PROPERTY_SET_NODE, &code, mpctx);
+        mp_property_do("user-data/nanum/os-language-name", M_PROPERTY_SET_NODE, &name, mpctx);
+    }
     wchar_t *wroot = app_root(tmp);
     if (wroot) {
         char *root = mp_to_utf8(tmp, wroot);

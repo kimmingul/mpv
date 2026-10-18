@@ -78,6 +78,7 @@
 #include "mpv_talloc.h"
 #include "common/av_common.h"
 #include "common/common.h"
+#include "common/global.h"
 #include "common/msg.h"
 #include "demux/demux.h"
 #include "demux/packet.h"
@@ -541,6 +542,7 @@ struct input {
     double inj_pts;             // pts of the last event the demuxer injected
     bool dirty;                 // events or ranges changed since they were saved
     atomic_uint gen;            // changes when injected events must be injected again
+    atomic_bool same_lang;      // the input's language is the target language: nothing to translate, the source is shown
     atomic_bool events_seen;    // the live path produced a line at least once
     atomic_bool held;           // injection waits for the engine (see event_settled())
     _Atomic double held_pts;
@@ -795,6 +797,8 @@ struct pgs_plan {
 static void pgs_replan(struct nanum *n, struct pgs_plan *out);
 static const char *lang_name(const char *iso1);
 static const char *lang_arg(const char *iso1, char *buf, size_t sz);
+static bool lang_is_target(struct nanum *n, const char *lang);
+static void set_same_lang(struct nanum *n, struct input *in, bool same);
 
 // Whether the media comes from the network (web page, stream, yt-dlp url). Such media
 // leaves nothing behind: no library identity, no translation cache, no result file
@@ -1412,8 +1416,8 @@ static void ass_escape(char **out, const char *s)
 }
 
 // ASS text of one cue for a presentation, NULL if the cue shows nothing:
-//   DISP_TRANSLATION  the translation only; a cue without one stays empty
-//                     (the source is never shown as a stand-in)
+//   DISP_TRANSLATION  the translation; a cue that could not be translated (server down, bad answer)
+//                     shows its source instead, so the screen is never blank because of the setting
 //   DISP_BILINGUAL    translation on top, source below in a smaller grey font;
 //                     source only if there is no translation
 //   DISP_SOURCE       the source only
@@ -1421,14 +1425,13 @@ static char *build_ass_text(void *ctx, int view, const char *src, const char *tr
 {
     bool have_tr = tr && tr[0];
     bool have_src = src && src[0];
-    if ((view == DISP_TRANSLATION && !have_tr) ||
-        (view == DISP_SOURCE && !have_src) || (!have_tr && !have_src))
+    if ((view == DISP_SOURCE && !have_src) || (!have_tr && !have_src))
         return NULL;
     size_t cap = 64 + (have_tr ? strlen(tr) * 2 : 0) + (have_src ? strlen(src) * 2 : 0);
     char *out = talloc_array(ctx, char, cap), *p = out;
     switch (view) {
     case DISP_TRANSLATION:
-        ass_escape(&p, tr);
+        ass_escape(&p, have_tr ? tr : src);
         break;
     case DISP_SOURCE:
         ass_escape(&p, src);
@@ -2723,10 +2726,12 @@ static char *ocr_clean(void *ctx, const char *lang, const char *text)
 }
 
 // The text of a decoded subtitle (a talloc child of ctx), NULL if it has none or the OCR
-// failed. Rectangles are read top to bottom.
-static char *pgs_ocr(void *ctx, struct input *in, const AVSubtitle *sub)
+// failed (*fails counts the failures in a row). Rectangles are read top to bottom. ocr_lang
+// is the Windows OCR recogniser, lang the language of the text (the cleanup depends on it).
+static char *ocr_subtitle(void *ctx, struct mp_log *log, const struct nanum_ai_api *api,
+                          const char *ocr_lang, const char *lang, const AVSubtitle *sub,
+                          int *fails)
 {
-    struct nanum *n = in->n;
     unsigned order[16];
     unsigned nr = MPMIN(sub->num_rects, 16u);
     for (unsigned i = 0; i < nr; i++)
@@ -2748,27 +2753,33 @@ static char *pgs_ocr(void *ctx, struct input *in, const AVSubtitle *sub)
         if (!g)
             continue;
         char buf[4096];
-        int ok = n->api.ocr(g, w, h, w, in->ocr_lang, buf, sizeof(buf));
+        int ok = api->ocr(g, w, h, w, ocr_lang, buf, sizeof(buf));
         free(g);
         if (!ok) {
-            if (++in->ocr_fail <= 3)
-                mp_warn(n->log, "OCR failed: %s\n", n->api.last_error());
-            if (in->ocr_fail >= 5)
-            {
-                char m[512];
-                NANUM_MSG(m, N_("the OCR does not work: %s"), sstr(n->api.last_error()));
-                ai_fail(in, m);
-            }
+            if (++*fails <= 3)
+                mp_warn(log, "OCR failed: %s\n", api->last_error());
             continue;
         }
-        in->ocr_fail = 0;
+        *fails = 0;
         if (buf[0])
             all = talloc_asprintf_append(all, "%s%s", all[0] ? "\n" : "", buf);
     }
     if (!all[0])
         return NULL;
-    char *clean = ocr_clean(ctx, in->lang, all);
+    char *clean = ocr_clean(ctx, lang, all);
     return clean[0] ? clean : NULL;
+}
+
+static char *pgs_ocr(void *ctx, struct input *in, const AVSubtitle *sub)
+{
+    struct nanum *n = in->n;
+    char *text = ocr_subtitle(ctx, n->log, &n->api, in->ocr_lang, in->lang, sub, &in->ocr_fail);
+    if (in->ocr_fail >= 5) {
+        char m[512];
+        NANUM_MSG(m, N_("the OCR does not work: %s"), sstr(n->api.last_error()));
+        ai_fail(in, m);
+    }
+    return text;
 }
 
 // Coverage of the run so far: what the demuxer has read, as far as every subtitle in it has
@@ -2924,6 +2935,7 @@ static MP_THREAD_VOID audio_thread(void *p)
     // English would load the English-only model first and read other languages with it.
     bool stt_input = in->idx == IN_SEC || (primary && atomic_load(&n->a_mode) == MODE_STT);
     char initial_language[sizeof(in->alang)] = "en";
+    bool lang_known = false;        // false: the "en" above is only a placeholder
     if (stt_input)
         snprintf(initial_language, sizeof(initial_language), "auto");
     mp_mutex_lock(&in->alock);
@@ -2934,12 +2946,16 @@ static MP_THREAD_VOID audio_thread(void *p)
             mp_mutex_unlock(&in->alock);
             MP_THREAD_RETURN();
         }
-        if (in->aswitch && in->alang[0] && strcmp(in->alang, "auto"))
+        if (in->aswitch && in->alang[0] && strcmp(in->alang, "auto")) {
             snprintf(initial_language, sizeof(initial_language), "%s", in->alang);
-        else if (in->ahead && in->ahead->text && in->ahead->dur < 0)
+            lang_known = true;
+        } else if (in->ahead && in->ahead->text && in->ahead->dur < 0) {
             snprintf(initial_language, sizeof(initial_language), "%s", in->ahead->text);
+            lang_known = in->ahead->text[0] != 0;
+        }
     } else {
         snprintf(initial_language, sizeof(initial_language), "%s", in->alang);
+        lang_known = true;
     }
     mp_mutex_unlock(&in->alock);
 
@@ -2949,14 +2965,19 @@ static MP_THREAD_VOID audio_thread(void *p)
     struct tr_snap ts;
     tr_snapshot(n, tmp, &ts);
     in->tr_applied = ts.gen;
+    // The input already is in the target language: the engine only recognises, nothing is translated.
+    const char *lang0 = primary && strcmp(o->language, "auto") ? o->language : initial_language;
+    bool same_lang = (lang_known || (primary && strcmp(o->language, "auto"))) && strcmp(lang0, "auto") &&
+                     lang_is_target(n, lang0);
+    set_same_lang(n, in, same_lang);
     struct nanum_ai_config cfg = {
         .abi_version = NANUM_AI_ABI_VERSION,
         .stt_model_path = o->stt_model,
         .vad_model_path = o->vad_model,
         .stt_model_multilingual_path = o->stt_model_multi,
-        .language = primary && strcmp(o->language, "auto") ? o->language : initial_language,
+        .language = lang0,
         .use_gpu = n->engine.use_gpu,
-        .translate_endpoint = o->tr_endpoint,
+        .translate_endpoint = same_lang ? "" : o->tr_endpoint,
         .translate_model = o->tr_model,
         .target_language = o->target_language,
         .cache_path = net_media(n) ? NULL : o->cache,
@@ -3286,12 +3307,14 @@ static void apply_mode(struct nanum *n, const struct rt_cfg *c)
 }
 
 #ifdef _WIN32
-// Loads the engine DLL (and its runtimes) into eng and resolves the API into api.
-static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_engine *eng,
-                     struct nanum_ai_api *api, char *why, size_t whysz)
+// Loads the engine DLL (and its runtimes) into eng and resolves the API into api. The
+// generation of subtitle files (nanum_generate()) has no struct nanum: it passes what it needs.
+static bool load_api_with(struct mp_log *log, const char *ai_dll, enum nanum_accel_mode mode,
+                          struct nanum_engine *eng, struct nanum_ai_api *api, char *why,
+                          size_t whysz)
 {
     char err[1024];
-    if (!nanum_accel_load_engine(n->log, mode, n->opts->ai_dll, eng, err, sizeof(err))) {
+    if (!nanum_accel_load_engine(log, mode, ai_dll, eng, err, sizeof(err))) {
         snprintf(why, whysz, "%s", err);
         return false;
     }
@@ -3335,6 +3358,12 @@ static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_e
     return true;
 }
 
+static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_engine *eng,
+                     struct nanum_ai_api *api, char *why, size_t whysz)
+{
+    return load_api_with(n->log, n->opts->ai_dll, mode, eng, api, why, whysz);
+}
+
 static bool load_engine(struct nanum *n)
 {
     char why[1024];
@@ -3371,6 +3400,14 @@ static void unload_engine(struct nanum *n)
 #else
 static bool load_api(struct nanum *n, enum nanum_accel_mode mode, struct nanum_engine *eng,
                      struct nanum_ai_api *api, char *why, size_t whysz)
+{
+    nanum_msg(why, whysz, N_("the AI engine is only available on Windows"), (const char *)NULL);
+    return false;
+}
+
+static bool load_api_with(struct mp_log *log, const char *ai_dll, enum nanum_accel_mode mode,
+                          struct nanum_engine *eng, struct nanum_ai_api *api, char *why,
+                          size_t whysz)
 {
     nanum_msg(why, whysz, N_("the AI engine is only available on Windows"), (const char *)NULL);
     return false;
@@ -5367,18 +5404,47 @@ static void lib_step(struct ctl *c, int64_t now, bool *sel)
 // ---------------------------------------------------------------------------
 // Names of the virtual tracks
 
-// Names of the languages the player knows by name (the Korean text is the catalog key);
-// others show their code.
+// Languages the player knows by name (the Korean text is the catalog key; others show their code).
+// name: what nanum-target-language says (the language the translation model is told), iso1 / iso2: the
+// codes of the language tag of a track. The generic "Chinese" comes first so that the code "zh" is
+// named "중국어"; the two scripts are only told apart by the target name.
+static const struct tlang {
+    const char *name, *iso1, *iso2, *key;
+} target_langs[] = {
+    {"Korean", "ko", "kor", N_("한국어")}, {"English", "en", "eng", N_("영어")},
+    {"Japanese", "ja", "jpn", N_("일본어")}, {"Chinese", "zh", "zho", N_("중국어")},
+    {"Simplified Chinese", "zh", "zho", N_("중국어 (간체)")},
+    {"Traditional Chinese", "zh", "zho", N_("중국어 (번체)")},
+    {"French", "fr", "fra", N_("프랑스어")}, {"German", "de", "deu", N_("독일어")},
+    {"Spanish", "es", "spa", N_("스페인어")}, {"Italian", "it", "ita", N_("이탈리아어")},
+    {"Russian", "ru", "rus", N_("러시아어")}, {"Portuguese", "pt", "por", N_("포르투갈어")},
+    {"Arabic", "ar", "ara", N_("아랍어")}, {"Hindi", "hi", "hin", N_("힌디어")},
+    {"Thai", "th", "tha", N_("태국어")}, {"Vietnamese", "vi", "vie", N_("베트남어")},
+    {"Indonesian", "id", "ind", N_("인도네시아어")}, {"Malay", "ms", "msa", N_("말레이어")},
+    {"Filipino", "tl", "fil", N_("필리핀어")}, {"Bengali", "bn", "ben", N_("벵골어")},
+    {"Dutch", "nl", "nld", N_("네덜란드어")}, {"Polish", "pl", "pol", N_("폴란드어")},
+    {"Turkish", "tr", "tur", N_("튀르키예어")}, {"Swedish", "sv", "swe", N_("스웨덴어")},
+    {"Danish", "da", "dan", N_("덴마크어")}, {"Norwegian", "no", "nor", N_("노르웨이어")},
+    {"Finnish", "fi", "fin", N_("핀란드어")}, {"Czech", "cs", "ces", N_("체코어")},
+    {"Greek", "el", "ell", N_("그리스어")}, {"Hebrew", "he", "heb", N_("히브리어")},
+    {"Hungarian", "hu", "hun", N_("헝가리어")}, {"Romanian", "ro", "ron", N_("루마니아어")},
+    {"Ukrainian", "uk", "ukr", N_("우크라이나어")}, {"Persian", "fa", "fas", N_("페르시아어")},
+};
+
+static const struct tlang *target_lang_by_name(const char *name)
+{
+    for (size_t i = 0; name && i < MP_ARRAY_SIZE(target_langs); i++) {
+        if (!strcasecmp(name, target_langs[i].name))
+            return &target_langs[i];
+    }
+    return NULL;
+}
+
 static const char *lang_key(const char *iso1)
 {
-    static const char *const names[][2] = {
-        {"en", N_("영어")}, {"ja", N_("일본어")}, {"ko", N_("한국어")}, {"zh", N_("중국어")},
-        {"fr", N_("프랑스어")}, {"de", N_("독일어")}, {"es", N_("스페인어")},
-        {"it", N_("이탈리아어")}, {"ru", N_("러시아어")}, {"pt", N_("포르투갈어")},
-    };
-    for (size_t i = 0; i < MP_ARRAY_SIZE(names); i++) {
-        if (!strcmp(iso1, names[i][0]))
-            return names[i][1];
+    for (size_t i = 0; i < MP_ARRAY_SIZE(target_langs); i++) {
+        if (!strcmp(iso1, target_langs[i].iso1))
+            return target_langs[i].key;
     }
     return NULL;
 }
@@ -5425,12 +5491,12 @@ static void primary_lang(struct nanum *n, const struct rt_cfg *cur, char out[8])
     snprintf(out, 8, "%s", strcmp(l, "auto") ? l : "");
 }
 
-// The target language as shown: the default "Korean" is named in the UI language, a language
-// the user typed is shown as typed.
+// The target language as shown: a language the player knows by name is named in the UI language, a
+// language the user typed is shown as typed.
 static const char *title_target(struct nanum *n)
 {
-    return !strcmp(n->opts->target_language, "Korean") ? nanum_tr("한국어")
-                                                       : n->opts->target_language;
+    const struct tlang *t = target_lang_by_name(n->opts->target_language);
+    return t ? nanum_tr(t->key) : n->opts->target_language;
 }
 
 // "한국어 (영어 음성 기반)": target language and what the cues come from.
@@ -5533,6 +5599,15 @@ static void titles_refresh(struct nanum *n)
     }
 }
 
+// The language the input reads is the target language: nothing to translate, the source is shown.
+static void set_same_lang(struct nanum *n, struct input *in, bool same)
+{
+    if (atomic_exchange(&in->same_lang, same) != same) {
+        atomic_fetch_add(&in->gen, 1);      // the demuxer injects the queued events again
+        wake_demux(n);
+    }
+}
+
 static void ctl_titles(struct ctl *c)
 {
     struct nanum *n = c->n;
@@ -5540,6 +5615,7 @@ static void ctl_titles(struct ctl *c)
     primary_lang(n, c->cur, lang);
     make_title(n, rt_mode(c->cur) == MODE_STT, lang, title, sizeof(title));
     set_title(n, IN_PRI, title);
+    set_same_lang(n, PRI(n), lang[0] && lang_is_target(n, lang));
     titles_refresh(n);
 }
 
@@ -7003,15 +7079,9 @@ static void imp_split_request(struct job *j, const char *req)
 
 static bool lang_is_target(struct nanum *n, const char *lang)
 {
-    static const char *const names[][2] = {
-        {"ko", "Korean"}, {"en", "English"}, {"ja", "Japanese"}, {"zh", "Chinese"},
-        {"fr", "French"}, {"de", "German"}, {"es", "Spanish"}, {"it", "Italian"},
-        {"ru", "Russian"}, {"pt", "Portuguese"},
-    };
-    for (size_t i = 0; i < MP_ARRAY_SIZE(names); i++) {
-        if (!strcmp(lang, names[i][0]) && !strcasecmp(n->opts->target_language, names[i][1]))
-            return true;
-    }
+    const struct tlang *t = target_lang_by_name(n->opts->target_language);
+    if (t && !strcmp(lang, t->iso1))
+        return true;
     return !strcasecmp(n->opts->target_language, lang);
 }
 
@@ -7183,8 +7253,9 @@ static char *decode_text(void *ctx, const unsigned char *s, size_t n, char enc[2
     return out;
 }
 
-// The dialogue of a cue without markup: {override tags}, <html tags>, line breaks.
-static char *sub_clean(void *ctx, const char *t)
+// The dialogue of a cue without markup: {override tags}, <html tags>, line breaks (kept as
+// "\n" if 'breaks', else one space).
+static char *sub_clean_ex(void *ctx, const char *t, bool breaks)
 {
     char *out = talloc_array(ctx, char, strlen(t) + 1);
     size_t o = 0;
@@ -7203,13 +7274,30 @@ static char *sub_clean(void *ctx, const char *t)
                 continue;
             }
         } else if (*p == '\\' && (p[1] == 'N' || p[1] == 'n' || p[1] == 'h')) {
+            bool brk = breaks && p[1] != 'h';
             p++;
+            if (brk) {
+                while (o && out[o - 1] == ' ')
+                    o--;
+                if (o && out[o - 1] != '\n')
+                    out[o++] = '\n';
+                space = true;
+                continue;
+            }
             if (!space)
                 out[o++] = ' ';
             space = true;
             continue;
         }
         char c = *p;
+        if (breaks && c == '\n') {
+            while (o && out[o - 1] == ' ')
+                o--;
+            if (o && out[o - 1] != '\n')
+                out[o++] = '\n';
+            space = true;
+            continue;
+        }
         if (c == '\n' || c == '\r' || c == '\t')
             c = ' ';
         if (c == ' ') {
@@ -7221,10 +7309,15 @@ static char *sub_clean(void *ctx, const char *t)
         }
         out[o++] = c;
     }
-    while (o && out[o - 1] == ' ')
+    while (o && (out[o - 1] == ' ' || out[o - 1] == '\n'))
         o--;
     out[o] = '\0';
     return out;
+}
+
+static char *sub_clean(void *ctx, const char *t)
+{
+    return sub_clean_ex(ctx, t, false);
 }
 
 static int cmp_cue(const void *a, const void *b)
@@ -8345,6 +8438,897 @@ static void input_init(struct nanum *n, int idx)
     mp_cond_init(&in->acond);
 }
 
+// ---------------------------------------------------------------------------
+// Playback-free subtitle generation (nanum_generate(), see nanum.h)
+//
+// A job of its own: it opens a demuxer of its own on the media (like the full scan), selects
+// the one stream it needs and reads it as fast as the source delivers, so nothing is decoded
+// for display and no playback state is touched. The source is
+//   speech recognition   audio -> the engine (scan only: the transcript is collected)
+//   a text track         the packets' text
+//   image subtitles      libavcodec bitmaps -> the engine's Windows OCR -> text
+// The finished source lines go to the caller (a source-language file) and, per target
+// language, through translate_all() on a translate-only engine instance (the same engine
+// the full translation uses, glossary and style included) to the caller again.
+
+static const struct {
+    const char *code, *name;
+} gen_langs[] = {
+    {"ko", "Korean"}, {"en", "English"}, {"ja", "Japanese"}, {"zh", "Chinese"},
+    {"fr", "French"}, {"de", "German"}, {"es", "Spanish"}, {"it", "Italian"},
+    {"ru", "Russian"}, {"pt", "Portuguese"}, {"nl", "Dutch"}, {"pl", "Polish"},
+    {"tr", "Turkish"}, {"vi", "Vietnamese"}, {"th", "Thai"}, {"id", "Indonesian"},
+    {"ar", "Arabic"}, {"hi", "Hindi"}, {"sv", "Swedish"}, {"cs", "Czech"},
+};
+
+struct gen {
+    const struct nanum_gen_request *rq;
+    struct nanum_gen_result *res;
+    void *ctx;
+    struct mp_log *log;
+    struct nanum_opts *o;
+    struct mpv_global *pg;          // the options the demuxer reads (all defaults)
+    struct demuxer *d;
+    struct nanum_engine eng;
+    struct nanum_ai_api api;
+    bool eng_up;
+    double base, dur;
+    struct nanum_gen_cue *cues;     // the source, media time, sorted
+    size_t nc;
+    char lang[8];                   // ISO 639-1 of the source, "" if unknown
+    char audio_langs[64];           // "en,ja"
+    // Result of translate_all() (written by the engine's thread).
+    mp_mutex lock;
+    mp_cond cond;
+    bool done;
+    double prog;
+    char *err;
+    struct nanum_ai_line *lines;
+    size_t nlines;
+    void *tctx;                     // owns err and lines
+};
+
+static bool gen_cancelled(const struct gen *g)
+{
+    return g->rq->cancel && mp_cancel_test(g->rq->cancel);
+}
+
+// Records the first error (stored message form). Always returns false.
+static bool gen_fail(struct gen *g, const char *code, const char *stored)
+{
+    struct nanum_gen_result *r = g->res;
+    if (r->error_code[0])
+        return false;
+    snprintf(r->error_code, sizeof(r->error_code), "%s", code);
+    nanum_msg_render(stored, r->error, sizeof(r->error));
+    char en[640];
+    mp_err(g->log, "subtitle generation: %s\n", msg_en(stored, en, sizeof(en)));
+    return false;
+}
+
+static void gen_warn(struct gen *g, const char *stored)
+{
+    char *w = g->res->warning;
+    size_t l = strlen(w);
+    if (l + 3 >= sizeof(g->res->warning))
+        return;
+    nanum_msg_render(stored, w + l + (l ? 2 : 0), sizeof(g->res->warning) - l - (l ? 2 : 0));
+    if (l)
+        memcpy(w + l, "; ", 2);
+    char en[640];
+    mp_warn(g->log, "subtitle generation: %s\n", msg_en(stored, en, sizeof(en)));
+}
+
+static void gen_progress(struct gen *g, int phase, double frac, int target, double pos,
+                         size_t lines)
+{
+    if (!g->rq->progress)
+        return;
+    struct nanum_gen_progress p = {
+        .phase = phase, .fraction = MPCLAMP(frac, 0.0, 1.0), .target = target,
+        .position = pos, .duration = g->dur, .lines = lines,
+    };
+    g->rq->progress(g->rq->user, &p);
+}
+
+// 1: *pkt is the next packet, 0: end of the stream, -1: cancelled.
+static int gen_next(struct gen *g, struct sh_stream *sh, struct demux_packet **pkt)
+{
+    *pkt = NULL;
+    for (;;) {
+        if (gen_cancelled(g))
+            return -1;
+        struct demux_packet *p = NULL;
+        int r = demux_read_packet_async(sh, &p);
+        if (r < 0)
+            return 0;
+        if (r == 0 || !p) {
+            mp_sleep_ns(MP_TIME_MS_TO_NS(5));
+            continue;
+        }
+        if (g->rq->limit > 0 && p->pts != MP_NOPTS_VALUE && p->pts - g->base > g->rq->limit) {
+            talloc_free(p);
+            return 0;
+        }
+        *pkt = p;
+        return 1;
+    }
+}
+
+static void gen_add_cue(struct gen *g, double start, double end, const char *text)
+{
+    start = fmax(start - g->base, 0);
+    end = fmax(end - g->base, start);
+    MP_TARRAY_APPEND(g->ctx, g->cues, g->nc, ((struct nanum_gen_cue){
+        .start = start, .end = end, .text = talloc_strdup(g->ctx, text),
+    }));
+}
+
+static int gen_cmp_cue(const void *a, const void *b)
+{
+    const struct nanum_gen_cue *x = a, *y = b;
+    return x->start < y->start ? -1 : x->start > y->start ? 1 : 0;
+}
+
+// Sorts the source, drops exact repeats and makes the lines follow each other: a line
+// ends where the next one starts, and no line is shorter than 0.3 s if there is room.
+static void gen_tidy_cues(struct gen *g)
+{
+    qsort(g->cues, g->nc, sizeof(*g->cues), gen_cmp_cue);
+    size_t w = 0;
+    for (size_t i = 0; i < g->nc; i++) {
+        if (w && fabs(g->cues[w - 1].start - g->cues[i].start) < 0.002 &&
+            !strcmp(g->cues[w - 1].text, g->cues[i].text))
+            continue;
+        g->cues[w++] = g->cues[i];
+    }
+    g->nc = w;
+    for (size_t i = 0; i < g->nc; i++) {
+        struct nanum_gen_cue *c = &g->cues[i];
+        double room = i + 1 < g->nc ? g->cues[i + 1].start : INFINITY;
+        if (c->end - c->start < 0.3)
+            c->end = c->start + 0.3;
+        if (c->end > room && room - c->start >= 0.1)
+            c->end = room;
+    }
+}
+
+static void gen_export_cb(void *user, const struct nanum_ai_line *lines, size_t nl)
+{
+    struct gen *g = user;
+    for (size_t i = 0; i < nl; i++) {
+        if (lines[i].source && lines[i].source[0])
+            gen_add_cue(g, lines[i].pts, lines[i].pts + lines[i].duration, lines[i].source);
+    }
+}
+
+static bool gen_engine(struct gen *g, enum nanum_accel_mode mode)
+{
+    if (g->eng_up)
+        return true;
+    char why[1024];
+    if (!load_api_with(g->log, g->o->ai_dll, mode, &g->eng, &g->api, why, sizeof(why)))
+        return gen_fail(g, "engine", why);
+    g->eng_up = true;
+    return true;
+}
+
+// Opens the media with a demuxer of its own. The player's own options (--aid, --edition,
+// --bluray-device, ...) can neither redirect the job nor be changed by it: the demuxer gets
+// a snapshot with every option at its default. The log and packet pool are shared.
+static bool gen_open(struct gen *g)
+{
+    g->pg = talloc_zero(g->ctx, struct mpv_global);
+    *g->pg = *g->rq->global;
+    g->pg->config = m_config_shadow_new(&mp_opt_root);
+    struct demuxer_params p = {
+        .is_top_level = false,
+        .stream_flags = STREAM_ORIGIN_DIRECT,
+        .allow_playlist_create = false,
+    };
+    g->d = demux_open_url(g->rq->url, &p, g->rq->cancel, g->pg);
+    if (!g->d) {
+        if (gen_cancelled(g))
+            return false;
+        return gen_fail(g, "open", msgl(N_("cannot open the source")));
+    }
+    g->dur = g->d->duration > 0 ? g->d->duration : 0;
+    g->base = g->d->start_time != MP_NOPTS_VALUE && g->d->start_time > 0 ? g->d->start_time : 0;
+    g->res->duration = g->dur;
+    if (g->rq->limit > 0 && (g->dur <= 0 || g->rq->limit < g->dur))
+        g->dur = g->rq->limit;      // the part that is read is what the progress is about
+    // The audio languages of the work (for the translator's profile).
+    int num = demux_get_num_stream(g->d);
+    for (int i = 0; i < num; i++) {
+        struct sh_stream *sh = demux_get_stream(g->d, i);
+        char l[8];
+        if (sh->type != STREAM_AUDIO)
+            continue;
+        iso2_from_mp(sh->lang, l, sizeof(l));
+        if (!strcmp(l, "auto") || csv_has(g->audio_langs, l) ||
+            strlen(g->audio_langs) + strlen(l) + 2 > sizeof(g->audio_langs))
+            continue;
+        size_t len = strlen(g->audio_langs);
+        snprintf(g->audio_langs + len, sizeof(g->audio_langs) - len, "%s%s", len ? "," : "", l);
+    }
+    return true;
+}
+
+static void gen_close_media(struct gen *g)
+{
+    if (g->d)
+        demux_free(g->d);
+    g->d = NULL;
+    if (g->pg) {
+        talloc_free(g->pg->config);
+        g->pg = NULL;
+    }
+}
+
+// The stream the source is read from: the requested track, else the best fit.
+static struct sh_stream *gen_pick_stream(struct gen *g)
+{
+    struct sh_stream *best = NULL;
+    int best_score = -1;
+    int num = demux_get_num_stream(g->d);
+    for (int i = 0; i < num; i++) {
+        struct sh_stream *sh = demux_get_stream(g->d, i);
+        bool ok;
+        switch (g->rq->source) {
+        case NANUM_GEN_STT:
+            ok = sh->type == STREAM_AUDIO;
+            break;
+        case NANUM_GEN_TEXT:
+            ok = sh->type == STREAM_SUB && sh->codec && is_text_codec(sh->codec->codec);
+            break;
+        default:
+            ok = sh->type == STREAM_SUB && sh->codec && is_image_codec(sh->codec->codec);
+        }
+        if (!ok || sh->absent)
+            continue;
+        if (g->rq->track >= 0) {
+            if (stream_key(sh) == g->rq->track)
+                return sh;
+            continue;
+        }
+        char l[8];
+        iso2_from_mp(sh->lang, l, sizeof(l));
+        int score = 10 + (sh->default_track ? 5 : 0) - (sh->forced_track ? 30 : 0);
+        if (g->rq->source_lang && g->rq->source_lang[0] && !strcmp(l, g->rq->source_lang))
+            score += 50;
+        else if (g->rq->source == NANUM_GEN_OCR && !strcmp(l, "en"))
+            score += 40;
+        if (score > best_score) {
+            best_score = score;
+            best = sh;
+        }
+    }
+    return best;
+}
+
+// ISO 639-1 of the source: what the caller said, else the track's, else (text) the script.
+static void gen_source_lang(struct gen *g, const struct sh_stream *sh)
+{
+    const char *given = g->rq->source_lang;
+    if (given && given[0]) {
+        snprintf(g->lang, sizeof(g->lang), "%s", given);
+        return;
+    }
+    char l[8];
+    iso2_from_mp(sh->lang, l, sizeof(l));
+    if (strcmp(l, "auto"))
+        snprintf(g->lang, sizeof(g->lang), "%s", l);
+}
+
+static bool gen_file_exists(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    FILE *f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    return f != NULL;
+}
+
+static bool gen_scan_stt(struct gen *g, struct sh_stream *sh)
+{
+    struct nanum_opts *o = g->o;
+    char lang[8] = "auto";
+    if (g->lang[0])
+        snprintf(lang, sizeof(lang), "%s", g->lang);
+    else if (strcmp(o->language, "auto"))
+        snprintf(lang, sizeof(lang), "%s", o->language);
+    // The models the engine will ask for must exist: say so before any work is done.
+    bool english = !strcmp(lang, "en");
+    const char *model = english || !o->stt_model_multi || !o->stt_model_multi[0]
+                        ? o->stt_model : o->stt_model_multi;
+    if (!gen_file_exists(model) || !gen_file_exists(o->vad_model)) {
+        char m[512];
+        NANUM_MSG(m, N_("the speech recognition model is not installed: %s"),
+                  !gen_file_exists(model) ? sstr(model) : sstr(o->vad_model));
+        return gen_fail(g, "no-model", m);
+    }
+    if (!gen_engine(g, o->acceleration))
+        return false;
+    struct nanum_ai_config cfg = {
+        .abi_version = NANUM_AI_ABI_VERSION,
+        .stt_model_path = o->stt_model,
+        .vad_model_path = o->vad_model,
+        .stt_model_multilingual_path = o->stt_model_multi,
+        .language = lang,
+        .use_gpu = g->eng.use_gpu,
+        .scan_only = 1,
+    };
+    struct nanum_ai *ai = g->api.create(&cfg, scan_event_cb, g);
+    if (!ai) {
+        char m[512];
+        NANUM_MSG(m, N_("cannot start the scan engine: %s"), sstr(g->api.last_error()));
+        return gen_fail(g, "stt", m);
+    }
+    struct adec dec = {.log = g->log, .api = &g->api, .ai = ai, .codec = sh->codec,
+                       .last_pkt_pts = MP_NOPTS_VALUE};
+    bool ok = false;
+    double scanned = MP_NOPTS_VALUE;
+    int64_t next_pace = 0;
+    for (;;) {
+        struct demux_packet *pkt;
+        int r = gen_next(g, sh, &pkt);
+        if (r < 0)
+            goto out;
+        if (!r)
+            break;
+        if (pkt->pts != MP_NOPTS_VALUE) {
+            if (!dec.avctx && !open_decoder(&dec)) {
+                talloc_free(pkt);
+                gen_fail(g, "stt", msgl(N_("cannot decode the audio")));
+                goto out;
+            }
+            decode_packet(&dec, pkt);
+            scanned = pkt->pts;
+        }
+        talloc_free(pkt);
+        int64_t now = mp_time_ns();
+        if (scanned == MP_NOPTS_VALUE || now < next_pace)
+            continue;
+        next_pace = now + MP_TIME_MS_TO_NS(100);
+        // The engine copies audio without limit: do not run more than 90 s ahead of what it
+        // has recognised. (If it reports nothing for 20 s, carry on.)
+        int64_t nan_since = 0;
+        while (!gen_cancelled(g)) {
+            double pu = g->api.processed_until(ai);
+            gen_progress(g, NANUM_GEN_SCAN, g->dur > 0 ? (isnan(pu) ? 0 : pu - g->base) / g->dur : 0,
+                         0, isnan(pu) ? 0 : pu - g->base, 0);
+            if (isnan(pu) ? scanned - g->base < 90 : scanned - pu < 90)
+                break;
+            if (isnan(pu)) {
+                now = mp_time_ns();
+                if (!nan_since)
+                    nan_since = now;
+                else if (now - nan_since > MP_TIME_S_TO_NS(20))
+                    break;
+            }
+            mp_sleep_ns(MP_TIME_MS_TO_NS(100));
+        }
+    }
+    gen_close_media(g);
+    adec_free(&dec);
+    g->api.flush(ai);
+    while (!gen_cancelled(g) && !g->api.wait_idle(ai, 200)) {
+        double pu = g->api.processed_until(ai);
+        gen_progress(g, NANUM_GEN_SCAN, g->dur > 0 ? (isnan(pu) ? 0 : pu - g->base) / g->dur : 0,
+                     0, isnan(pu) ? 0 : pu - g->base, 0);
+    }
+    if (gen_cancelled(g))
+        goto out;
+    g->api.transcript_export(ai, gen_export_cb, g);
+    ok = true;
+out:
+    adec_free(&dec);
+    g->api.cancel_full(ai);
+    g->api.destroy(ai);
+    return ok;
+}
+
+static bool gen_scan_text(struct gen *g, struct sh_stream *sh)
+{
+    void *tmp = talloc_new(NULL);
+    bool ok = false;
+    for (;;) {
+        struct demux_packet *pkt;
+        int r = gen_next(g, sh, &pkt);
+        if (r < 0)
+            goto out;
+        if (!r)
+            break;
+        char *t = pkt->pts != MP_NOPTS_VALUE ? packet_text(tmp, sh->codec->codec, pkt) : NULL;
+        if (t) {
+            char *clean = sub_clean_ex(tmp, t, true);
+            if (clean[0])
+                gen_add_cue(g, pkt->pts, pkt->pts + (pkt->duration > 0 ? pkt->duration : 2.5),
+                            clean);
+            talloc_free(t);
+            talloc_free(clean);
+            if (g->dur > 0)
+                gen_progress(g, NANUM_GEN_SCAN, (pkt->pts - g->base) / g->dur, 0,
+                             pkt->pts - g->base, g->nc);
+        }
+        talloc_free(pkt);
+    }
+    ok = true;
+out:
+    talloc_free(tmp);
+    return ok;
+}
+
+static AVCodecContext *gen_open_sub_decoder(struct gen *g, const struct mp_codec_params *c)
+{
+    const AVCodec *codec = avcodec_find_decoder(mp_codec_to_av_codec_id(c->codec));
+    if (!codec)
+        return NULL;
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    if (!ctx || mp_set_avctx_codec_headers(ctx, c) < 0) {
+        avcodec_free_context(&ctx);
+        return NULL;
+    }
+    ctx->pkt_timebase = mp_get_codec_timebase(c);
+    if (avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        return NULL;
+    }
+    mp_verbose(g->log, "reading image subtitles: %s\n", c->codec);
+    return ctx;
+}
+
+static bool gen_scan_ocr(struct gen *g, struct sh_stream *sh)
+{
+    if (!g->lang[0])
+        return gen_fail(g, "ocr", msgl(N_("the image subtitle has no language")));
+    if (!gen_engine(g, NANUM_ACCEL_CPU))
+        return false;
+    char langs[256] = "", ocr[8], note[256], reason[256];
+    g->api.ocr_languages(langs, sizeof(langs));
+    if (!pick_ocr_lang(langs, g->lang, ocr, note, sizeof(note), reason, sizeof(reason)))
+        return gen_fail(g, "ocr", reason);
+    if (note[0])
+        gen_warn(g, note);
+    AVCodecContext *vctx = gen_open_sub_decoder(g, sh->codec);
+    if (!vctx)
+        return gen_fail(g, "ocr", msgl(N_("cannot open the image subtitle decoder")));
+    bool dvd = is_dvd_sub(sh->codec);
+    void *tmp = talloc_new(NULL);
+    bool ok = false, pending = false;
+    double pstart = 0;
+    char *ptext = NULL;
+    int fails = 0;
+    for (;;) {
+        struct demux_packet *pkt;
+        int r = gen_next(g, sh, &pkt);
+        if (r < 0)
+            goto out;
+        if (!r)
+            break;
+        if (pkt->pts == MP_NOPTS_VALUE) {
+            talloc_free(pkt);
+            continue;
+        }
+        // A subtitle without a closing display set does not stay on screen for ever.
+        if (pending && pkt->pts - pstart > PGS_MAX_DUR + 4) {
+            gen_add_cue(g, pstart, pstart + PGS_MAX_DUR, ptext);
+            pending = false;
+        }
+        AVPacket *avp = av_packet_alloc();
+        AVSubtitle sub;
+        int got = 0, dr = -1;
+        if (avp) {
+            AVRational tb = vctx->pkt_timebase;
+            mp_set_av_packet(avp, pkt, &tb);
+            dr = avcodec_decode_subtitle2(vctx, &sub, &got, avp);
+            mp_free_av_packet(&avp);
+        }
+        if (dr >= 0 && got) {
+            double start = pkt->pts + sub.start_display_time / 1000.0;
+            // A display set ends the subtitle that is on screen.
+            if (pending) {
+                gen_add_cue(g, pstart, MPCLAMP(start, pstart + 0.3, pstart + PGS_MAX_DUR), ptext);
+                pending = false;
+            }
+            if (sub.num_rects) {
+                void *t2 = talloc_new(tmp);
+                char *text = ocr_subtitle(t2, g->log, &g->api, ocr, g->lang, &sub, &fails);
+                if (fails >= 5) {
+                    char m[512];
+                    NANUM_MSG(m, N_("the OCR does not work: %s"), sstr(g->api.last_error()));
+                    talloc_free(t2);
+                    avsubtitle_free(&sub);
+                    talloc_free(pkt);
+                    gen_fail(g, "ocr", m);
+                    goto out;
+                }
+                if (text) {
+                    if (dvd && sub.end_display_time > sub.start_display_time &&
+                        sub.end_display_time != UINT32_MAX) {
+                        gen_add_cue(g, start, pkt->pts + sub.end_display_time / 1000.0, text);
+                    } else {
+                        pending = true;
+                        pstart = start;
+                        talloc_free(ptext);
+                        ptext = talloc_strdup(tmp, text);
+                    }
+                }
+                talloc_free(t2);
+            }
+            avsubtitle_free(&sub);
+        }
+        if (g->dur > 0)
+            gen_progress(g, NANUM_GEN_SCAN, (pkt->pts - g->base) / g->dur, 0,
+                         pkt->pts - g->base, g->nc);
+        talloc_free(pkt);
+    }
+    if (pending)
+        gen_add_cue(g, pstart, pstart + 3.0, ptext);
+    ok = true;
+out:
+    avcodec_free_context(&vctx);
+    talloc_free(tmp);
+    return ok;
+}
+
+// ---- translation
+
+static void gen_full_cb(void *user, double progress, const struct nanum_ai_line *lines,
+                        size_t nl, const char *error)
+{
+    struct gen *g = user;
+    mp_mutex_lock(&g->lock);
+    if (!error && !(lines && nl)) {
+        g->prog = progress;
+        mp_mutex_unlock(&g->lock);
+        return;
+    }
+    // Final call: keep a copy, the engine owns the pointers only for now.
+    if (error) {
+        g->err = talloc_strdup(g->tctx, error);
+    } else {
+        g->lines = talloc_array(g->tctx, struct nanum_ai_line, nl);
+        for (size_t i = 0; i < nl; i++) {
+            g->lines[i] = (struct nanum_ai_line){
+                .pts = lines[i].pts,
+                .duration = lines[i].duration,
+                .source = talloc_strdup(g->lines, lines[i].source ? lines[i].source : ""),
+                .translation = talloc_strdup(g->lines,
+                                             lines[i].translation ? lines[i].translation : ""),
+            };
+        }
+        g->nlines = nl;
+    }
+    g->done = true;
+    mp_cond_signal(&g->cond);
+    mp_mutex_unlock(&g->lock);
+}
+
+// The glossary of the work for one target language: what the caller gave, else the
+// translator's own knowledge of the work (nanum_ai_profile(), a blocking LLM query that runs on
+// a thread of its own so cancelling is never held up by it). NULL if there is none.
+static char *gen_glossary(struct gen *g, int ti, const char *tname)
+{
+    if (g->rq->glossary && g->rq->glossary[0])
+        return talloc_strdup(g->ctx, g->rq->glossary);
+    if (!g->rq->title || !g->rq->title[0])
+        return NULL;
+    struct nanum_opts *o = g->o;
+    char why[1024];
+    struct pjob *pj = talloc_zero(NULL, struct pjob);
+    if (!load_api_with(g->log, o->ai_dll, NANUM_ACCEL_CPU, &pj->eng, &pj->api, why,
+                       sizeof(why))) {
+        talloc_free(pj);
+        gen_warn(g, why);
+        return NULL;
+    }
+    pj->cfg = (struct nanum_ai_config){
+        .abi_version = NANUM_AI_ABI_VERSION,
+        .translate_endpoint = talloc_strdup(pj, o->tr_endpoint),
+        .translate_model = talloc_strdup(pj, o->tr_model),
+        .target_language = talloc_strdup(pj, tname),
+        .translate_engine = o->full_engine == ENGINE_OMP ? "omp" : "ollama",
+        .omp_model = talloc_strdup(pj, o->omp_model ? o->omp_model : ""),
+        .omp_command = talloc_strdup(pj, o->omp_command ? o->omp_command : ""),
+    };
+    pj->title = talloc_strdup(pj, g->rq->title);
+    pj->langs = talloc_strdup(pj, g->audio_langs);
+    atomic_init(&pj->st, PJ_RUNNING);
+    mp_thread t;
+    if (mp_thread_create(&t, profile_thread, pj)) {
+        pjob_free(pj);
+        return NULL;
+    }
+    mp_thread_detach(t);
+    while (atomic_load(&pj->st) == PJ_RUNNING) {
+        if (gen_cancelled(g)) {
+            pjob_abandon(pj);
+            return NULL;
+        }
+        gen_progress(g, NANUM_GEN_GLOSSARY, 0, ti, 0, 0);
+        mp_sleep_ns(MP_TIME_MS_TO_NS(100));
+    }
+    char *glossary = NULL;
+    if (pj->ok) {
+        void *tmp = talloc_new(NULL);
+        char *json = talloc_strdup(tmp, pj->out);
+        char *s = json;
+        struct mpv_node root;
+        if (json_parse(tmp, &root, &s, MAX_JSON_DEPTH) >= 0 && root.format == MPV_FORMAT_NODE_MAP) {
+            const char *found = node_str(&root, "glossary");
+            if (found[0])
+                glossary = talloc_strdup(g->ctx, found);
+        }
+        talloc_free(tmp);
+    } else {
+        char m[512];
+        NANUM_MSG(m, N_("no glossary of the work could be made: %s"), pj->err);
+        gen_warn(g, m);
+    }
+    pjob_free(pj);
+    return glossary;
+}
+
+// The language code of a target: its code, else the one its name stands for.
+static void gen_target_code(const struct nanum_gen_target *t, char out[8])
+{
+    snprintf(out, 8, "%s", t->code ? t->code : "");
+    for (char *s = out; *s; s++)
+        *s = (char)tolower((unsigned char)*s);
+    for (size_t i = 0; !out[0] && t->name && i < MP_ARRAY_SIZE(gen_langs); i++) {
+        if (!strcasecmp(t->name, gen_langs[i].name))
+            snprintf(out, 8, "%s", gen_langs[i].code);
+    }
+}
+
+static const char *gen_target_name(const struct nanum_gen_target *t)
+{
+    if (t->name && t->name[0])
+        return t->name;
+    for (size_t i = 0; t->code && i < MP_ARRAY_SIZE(gen_langs); i++) {
+        if (!strncasecmp(t->code, gen_langs[i].code, 2) && !t->code[2])
+            return gen_langs[i].name;
+    }
+    return t->code ? t->code : "";
+}
+
+// The source already is in the target language ("zh" is also "zh-CN"; "zh-TW" is another
+// script and does get a translation).
+static bool gen_same_language(const struct gen *g, const char *tcode)
+{
+    return g->lang[0] && tcode[0] && !strcasecmp(g->lang, tcode);
+}
+
+// Translates the source into one target. false: cancelled or failed (recorded).
+static bool gen_translate(struct gen *g, int ti, bool *skipped)
+{
+    const struct nanum_gen_target *t = &g->rq->targets[ti];
+    struct nanum_opts *o = g->o;
+    const char *tname = gen_target_name(t);
+    char tcode[8];
+    gen_target_code(t, tcode);
+    *skipped = false;
+    if (gen_same_language(g, tcode)) {
+        *skipped = true;
+        if (g->rq->target_done)
+            g->rq->target_done(g->rq->user, ti, "same-language", "");
+        return true;
+    }
+    char *glossary = gen_glossary(g, ti, tname);
+    if (gen_cancelled(g))
+        return false;
+    if (!gen_engine(g, NANUM_ACCEL_CPU))
+        return false;
+    struct nanum_ai_config cfg = {
+        .abi_version = NANUM_AI_ABI_VERSION,
+        .language = g->lang[0] ? g->lang : "en",
+        .translate_endpoint = o->tr_endpoint,
+        .translate_model = o->tr_model,
+        .target_language = tname,
+        .translate_engine = o->full_engine == ENGINE_OMP ? "omp" : "ollama",
+        .omp_model = o->omp_model,
+        .omp_command = o->omp_command,
+        .scan_only = 1,
+        .translate_only = 1,
+        .translate_style = style_names[o->style],
+        .translate_style_text = o->style_text ? o->style_text : "",
+        .glossary = glossary ? glossary : "",
+    };
+    struct nanum_ai *ai = g->api.create(&cfg, scan_event_cb, g);
+    if (!ai) {
+        char m[512];
+        NANUM_MSG(m, N_("cannot start the translation engine: %s"), sstr(g->api.last_error()));
+        return gen_fail(g, "translate", m);
+    }
+    bool ok = false;
+    for (size_t i = 0; i < g->nc; i++) {
+        // The engine translates one line of text per cue.
+        char *flat = sub_clean(g->ctx, g->cues[i].text);
+        g->api.push_text(ai, g->cues[i].start, g->cues[i].end - g->cues[i].start, flat);
+        talloc_free(flat);
+    }
+    if (g->api.transcript_size(ai) == 0) {
+        gen_fail(g, "translate", msgl(N_("the subtitles have nothing to translate")));
+        goto out;
+    }
+    mp_mutex_lock(&g->lock);
+    talloc_free(g->tctx);
+    g->tctx = talloc_new(g->ctx);
+    g->done = false;
+    g->prog = 0;
+    g->err = NULL;
+    g->lines = NULL;
+    g->nlines = 0;
+    mp_mutex_unlock(&g->lock);
+    if (g->api.translate_all(ai, gen_full_cb, g)) {
+        gen_fail(g, "translate", msgl(N_("cannot start the translation")));
+        goto out;
+    }
+    mp_mutex_lock(&g->lock);
+    while (!g->done && !gen_cancelled(g)) {
+        double p = g->prog;
+        mp_mutex_unlock(&g->lock);
+        gen_progress(g, NANUM_GEN_TRANSLATE, p, ti, 0, 0);
+        mp_mutex_lock(&g->lock);
+        mp_cond_timedwait(&g->cond, &g->lock, MP_TIME_MS_TO_NS(200));
+    }
+    bool done = g->done;
+    char *err = g->err ? talloc_strdup(NULL, g->err) : NULL;
+    mp_mutex_unlock(&g->lock);
+    if (!done)
+        goto out;               // cancelled
+    if (err) {
+        char m[800];
+        NANUM_MSG(m, N_("translation into %s failed: %s"), tname, err);
+        talloc_free(err);
+        gen_fail(g, "translate", m);
+        goto out;
+    }
+    // The lines the engine kept (it drops sound-only lines), each with its translation. A
+    // line that could not be translated is left out: the source is never shown in its place.
+    struct nanum_gen_cue *out = talloc_array(g->ctx, struct nanum_gen_cue, g->nlines);
+    size_t no = 0;
+    for (size_t i = 0; i < g->nlines; i++) {
+        if (!g->lines[i].translation[0])
+            continue;
+        out[no++] = (struct nanum_gen_cue){
+            .start = g->lines[i].pts,
+            .end = g->lines[i].pts + fmax(g->lines[i].duration, 0.3),
+            .text = g->lines[i].translation,
+        };
+    }
+    for (size_t i = 0; i + 1 < no; i++) {
+        if (out[i].end > out[i + 1].start && out[i + 1].start - out[i].start >= 0.1)
+            out[i].end = out[i + 1].start;
+    }
+    if (!no) {
+        gen_fail(g, "translate", msgl(N_("the translator returned no text")));
+        goto out_cues;
+    }
+    if (no < g->nlines) {
+        char c1[24], c2[24], m[256];
+        snprintf(c1, sizeof(c1), "%zu", g->nlines - no);
+        snprintf(c2, sizeof(c2), "%s", tname);
+        NANUM_MSG(m, N_("%s lines could not be translated into %s and are missing"), c1, c2);
+        gen_warn(g, m);
+    }
+    char eerr[512] = "";
+    if (!g->rq->emit(g->rq->user, NANUM_GEN_ROLE_TRANSLATION, ti, tcode, tname, out, no, eerr,
+                     sizeof(eerr))) {
+        gen_fail(g, "write", eerr);
+        goto out_cues;
+    }
+    ok = true;
+out_cues:
+    talloc_free(out);
+out:
+    g->api.cancel_full(ai);     // no callback after this
+    g->api.destroy(ai);
+    return ok;
+}
+
+void nanum_generate(const struct nanum_gen_request *rq, struct nanum_gen_result *res)
+{
+    *res = (struct nanum_gen_result){0};
+    struct gen *g = talloc_zero(NULL, struct gen);
+    g->rq = rq;
+    g->res = res;
+    g->ctx = g;
+    g->log = rq->log;
+    mp_mutex_init(&g->lock);
+    mp_cond_init(&g->cond);
+    g->tctx = talloc_new(g);
+    g->o = mp_get_config_group(g, rq->global, &nanum_conf);
+    struct sh_stream *sh = NULL;
+
+    if (rq->num_targets > 0 && !(g->o->tr_endpoint && g->o->tr_endpoint[0])) {
+        gen_fail(g, "translate", msgl(N_("translation is turned off: no translation server is set")));
+        goto out;
+    }
+    gen_progress(g, NANUM_GEN_OPEN, 0, 0, 0, 0);
+    if (!gen_open(g))
+        goto out;
+    sh = gen_pick_stream(g);
+    if (!sh) {
+        gen_fail(g, "no-track", msgl(rq->source == NANUM_GEN_STT ? N_("the media has no audio track")
+                 : rq->source == NANUM_GEN_TEXT ? N_("the text subtitle track was not found")
+                 : N_("no image subtitle track")));
+        goto out;
+    }
+    gen_source_lang(g, sh);
+    demuxer_select_track(g->d, sh, MP_NOPTS_VALUE, true);
+    mp_info(g->log, "generating subtitles: %s, track %d (%s)\n",
+            rq->source == NANUM_GEN_STT ? "speech" : rq->source == NANUM_GEN_TEXT ? "text"
+            : "image subtitles", stream_key(sh), g->lang[0] ? g->lang : "language unknown");
+
+    bool ok = rq->source == NANUM_GEN_STT ? gen_scan_stt(g, sh)
+              : rq->source == NANUM_GEN_TEXT ? gen_scan_text(g, sh) : gen_scan_ocr(g, sh);
+    gen_close_media(g);
+    if (!ok || gen_cancelled(g))
+        goto out;
+    gen_tidy_cues(g);
+    if (!g->nc) {
+        gen_fail(g, "no-text", msgl(rq->source == NANUM_GEN_STT ? N_("no speech was recognised")
+                 : N_("the subtitle track has no text")));
+        goto out;
+    }
+    snprintf(res->source_lang, sizeof(res->source_lang), "%s", g->lang);
+    res->source_lines = g->nc;
+    mp_info(g->log, "transcript: %zu lines\n", g->nc);
+
+    // The source goes to disk before anything is translated: if the translation fails or is
+    // cancelled the file is what the work was for.
+    char eerr[512] = "";
+    if (!rq->emit(rq->user, NANUM_GEN_ROLE_SOURCE, -1, g->lang, "", g->cues, g->nc, eerr,
+                  sizeof(eerr))) {
+        gen_fail(g, "write", eerr);
+        goto out;
+    }
+    // A target that fails does not stop the next ones; the first failure is what the result
+    // reports. (gen_fail() records only the first error, so it is cleared per target.)
+    char first_code[sizeof(res->error_code)] = "", first_err[sizeof(res->error)] = "";
+    for (int i = 0; i < rq->num_targets && !gen_cancelled(g); i++) {
+        bool skipped;
+        res->error_code[0] = res->error[0] = '\0';
+        if (gen_translate(g, i, &skipped)) {
+            if (!skipped)
+                res->targets_done++;
+            continue;
+        }
+        if (gen_cancelled(g))
+            break;
+        res->targets_failed++;
+        if (rq->target_done)
+            rq->target_done(rq->user, i, "failed", res->error);
+        if (!first_code[0]) {
+            memcpy(first_code, res->error_code, sizeof(first_code));
+            memcpy(first_err, res->error, sizeof(first_err));
+        }
+        if (!strcmp(res->error_code, "write"))
+            break;
+    }
+    if (!gen_cancelled(g) && first_code[0]) {
+        memcpy(res->error_code, first_code, sizeof(res->error_code));
+        memcpy(res->error, first_err, sizeof(res->error));
+    } else {
+        res->error_code[0] = res->error[0] = '\0';
+    }
+out:
+    if (gen_cancelled(g) && !res->error_code[0]) {
+        res->cancelled = true;
+        snprintf(res->error_code, sizeof(res->error_code), "cancelled");
+    }
+    res->ok = !res->error_code[0];
+    gen_close_media(g);
+    if (g->eng_up)
+        unload_api(&g->eng);
+    mp_mutex_destroy(&g->lock);
+    mp_cond_destroy(&g->cond);
+    talloc_free(g);
+}
+
 struct nanum *nanum_create(void *parent, struct mpv_global *global,
                            struct mp_log *log)
 {
@@ -8529,7 +9513,8 @@ struct sh_stream *nanum_alloc_stream(struct nanum *n, int input)
     struct input *in = &n->in[input];
     struct sh_stream *sh = demux_alloc_sh_stream(STREAM_SUB);
     sh->demuxer_id = virtual_id(input);
-    sh->lang = talloc_strdup(sh, "kor");
+    const struct tlang *tl = target_lang_by_name(n->opts->target_language);
+    sh->lang = tl ? talloc_strdup(sh, tl->iso2) : NULL;
     sh->codec->codec = "ass";
     sh->codec->extradata = talloc_memdup(sh->codec, (void *)ass_header,
                                          sizeof(ass_header) - 1);
@@ -8909,7 +9894,7 @@ struct demux_packet *nanum_next_packet(struct nanum *n,
     struct demux_packet *dp = NULL;
 
     mp_mutex_lock(&n->lock);
-    int view = effective_view(n);
+    int view = atomic_load(&in->same_lang) ? DISP_SOURCE : effective_view(n);
     unsigned gen = atomic_load(&in->gen);
     bool stt = is_stt_input(in);
     atomic_store(&in->held, false);

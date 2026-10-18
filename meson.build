@@ -560,6 +560,7 @@ if features['win32-desktop']
                      'osdep/nanum-models-win.c',
                      'osdep/nanum-open-win.c',
                      'osdep/nanum-youtube-win.c',
+                     'osdep/nanum-generate-win.c',
                      'osdep/nanum-startup-win.c',
                      'osdep/nanum-private-win.c',
                      'osdep/w32_register.c',

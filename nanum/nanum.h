@@ -237,4 +237,87 @@ bool nanum_take_audio_replay(struct nanum *n, const struct sh_stream *sh);
 
 void nanum_get_status(struct nanum *n, struct nanum_status *st);
 
+// ---------------------------------------------------------------------------
+// Playback-free subtitle generation (nanum_generate(), driven by the commands of
+// osdep/nanum-generate-win.c). No struct nanum and no player state: the job opens its own demuxer
+// on the media, reads the one stream it needs at full speed (nothing is rendered or played),
+// and hands the finished subtitle files to the caller.
+
+// Where the source subtitle comes from.
+enum nanum_gen_source {
+    NANUM_GEN_STT,      // speech recognition of an audio track
+    NANUM_GEN_TEXT,     // a text subtitle track (or a subtitle file) of the media
+    NANUM_GEN_OCR,      // an image subtitle track (PGS, DVD) read by the Windows OCR
+};
+
+struct nanum_gen_target {
+    const char *code;   // ISO 639-1 ("ko"), may be empty if only the name is known
+    const char *name;   // the language as the translator is told ("Korean"), may be empty
+};
+
+// A subtitle line, in media time (seconds since the start of the media).
+struct nanum_gen_cue {
+    double start, end;
+    const char *text;   // lines separated by '\n'
+};
+
+enum nanum_gen_phase {
+    NANUM_GEN_OPEN,         // opening the media
+    NANUM_GEN_SCAN,         // reading the source (speech recognition / text / OCR)
+    NANUM_GEN_GLOSSARY,     // asking the translator about the work
+    NANUM_GEN_TRANSLATE,    // translating into targets[target]
+};
+
+enum nanum_gen_role { NANUM_GEN_ROLE_SOURCE, NANUM_GEN_ROLE_TRANSLATION };
+
+struct nanum_gen_progress {
+    int phase;              // enum nanum_gen_phase
+    double fraction;        // 0..1 within the phase
+    int target;             // NANUM_GEN_TRANSLATE: index into targets
+    double position;        // NANUM_GEN_SCAN: media time reached
+    double duration;        // length of the media, 0 if unknown
+    size_t lines;           // NANUM_GEN_SCAN: lines found so far
+};
+
+struct nanum_gen_request {
+    struct mpv_global *global;  // the player's settings (nanum-* options)
+    struct mp_log *log;
+    struct mp_cancel *cancel;   // triggered to stop the job
+    const char *url;            // file path, URL, or bd://longest/E: / bd://mpls/00800/E:
+    int source;                 // enum nanum_gen_source
+    int track;                  // demuxer id (track-list "src-id") of the track; -1: choose
+    const char *source_lang;    // ISO 639-1 of the source; NULL/"": the track's, else detected
+    const struct nanum_gen_target *targets;
+    int num_targets;
+    const char *title;          // what the work is called (glossary), may be NULL
+    const char *glossary;       // lines "source => target" to translate with, may be NULL
+    double limit;               // > 0: only the first 'limit' seconds of the media (a preview)
+    void *user;
+    void (*progress)(void *user, const struct nanum_gen_progress *p);
+    // A file is complete: write it. target: index of the target (-1: the source). false: it
+    // could not be written (err: why, rendered).
+    bool (*emit)(void *user, int role, int target, const char *code, const char *name,
+                 const struct nanum_gen_cue *cues, size_t num, char *err, size_t err_size);
+    // The outcome of a target without a file: "same-language" (the source is already in it) or
+    // "failed" (msg: why). Targets that got a file are reported by emit().
+    void (*target_done)(void *user, int target, const char *state, const char *msg);
+};
+
+struct nanum_gen_result {
+    bool ok;                    // every requested file was written
+    bool cancelled;
+    char error[640];            // rendered in the interface language
+    char error_code[24];        // "" or: open, no-track, engine, no-model, stt, ocr, no-text,
+                                // translate, write, cancelled, internal
+    char source_lang[8];        // what the source turned out to be, "" if unknown
+    char warning[640];          // non-fatal problems (rendered), e.g. no glossary
+    size_t source_lines;
+    double duration;
+    int targets_done, targets_failed;
+};
+
+// Blocking; call it from a worker thread. Safe to cancel at any time: files already
+// emitted stay.
+void nanum_generate(const struct nanum_gen_request *rq, struct nanum_gen_result *res);
+
 #endif
