@@ -3610,7 +3610,7 @@ void nanum_get_status(struct nanum *n, struct nanum_status *st)
     st->imp_confidence = n->imp_conf;
     st->imp_low_confidence = n->imp_low;
     memcpy(st->imp_lang, n->imp_lang, sizeof(st->imp_lang));
-    if (!strcmp(n->imp_origin, "파일"))
+    if (!strcmp(n->imp_origin, "파일")) // i18n-ignore: stored identity of the default origin, shown via nanum_tr()
         snprintf(st->imp_origin, sizeof(st->imp_origin), "%s", nanum_tr("파일"));
     else
         memcpy(st->imp_origin, n->imp_origin, sizeof(st->imp_origin));
@@ -5523,7 +5523,7 @@ static void make_title_import(struct nanum *n, const char *origin, const char *l
                               bool direct, char *out, size_t sz)
 {
     const char *target = title_target(n);
-    if (!strcmp(origin, "파일"))
+    if (!strcmp(origin, "파일")) // i18n-ignore: stored identity of the default origin, shown via nanum_tr()
         origin = nanum_tr("파일");
     if (direct)
         snprintf(out, sz, "%s (%s)", target, origin);
@@ -7066,7 +7066,7 @@ static void imp_parse(void *ctx, const char *req, char **path, char **lang, char
     *path = s;
     if (!(*origin)[0]) {
         talloc_free(*origin);
-        *origin = talloc_strdup(ctx, "파일");
+        *origin = talloc_strdup(ctx, "파일"); // i18n-ignore: stored identity, shown via nanum_tr()
     }
 }
 
@@ -7949,7 +7949,7 @@ static void imp_load_saved(struct ctl *c)
     c->imp = (struct imp_ctl){.offset = off, .scale = scale, .conf = conf, .low = low,
                               .direct = direct, .shown = true};
     snprintf(c->imp.lang, sizeof(c->imp.lang), "%s", lang);
-    snprintf(c->imp.origin, sizeof(c->imp.origin), "%s", origin[0] ? origin : "파일");
+    snprintf(c->imp.origin, sizeof(c->imp.origin), "%s", origin[0] ? origin : "파일"); // i18n-ignore: stored identity
     snprintf(c->imp.key, sizeof(c->imp.key), "%s", key);
     mp_mutex_lock(&n->slock);
     n->imp_scale = scale;
@@ -9384,7 +9384,7 @@ struct nanum *nanum_create(void *parent, struct mpv_global *global,
         // point the AI thread uses.
         for (int k = 0; k < 4 * 3600 / 5; k++) {
             int s = k * 5;
-            char *t = talloc_asprintf(NULL,
+            char *t = talloc_asprintf(NULL, // i18n-ignore: developer-only --nanum-test-subs fixture
                 "[NanumPlayer 테스트] 자막 #%d (%02d:%02d)",
                 k, s / 60, s % 60);
             nanum_add_cue(n, IN_PRI, s, 3.0, t, t);

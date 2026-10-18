@@ -355,6 +355,9 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
                           double ref_pts, bool selected);
 void demuxer_refresh_track(struct demuxer *demuxer, struct sh_stream *stream,
                            double ref_pts);
+// Whether a subtitle stream the player just selected needs a player seek to get its
+// packets for the part that is already read ahead (see the implementation).
+bool demuxer_select_needs_seek(struct demuxer *demuxer, struct sh_stream *stream);
 
 int demuxer_help(struct mp_log *log, const m_option_t *opt, struct bstr name);
 

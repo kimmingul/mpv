@@ -45,6 +45,7 @@
 #include "common/msg.h"
 #include "misc/thread_tools.h"
 #include "osdep/io.h"
+#include "osdep/nanum-disc-component.h"
 #include "osdep/nanum-disc-keys.h"
 #include "osdep/nanum-download.h"
 #include "osdep/threads.h"
@@ -100,40 +101,6 @@ static void win_fail(struct nanum_dl *dl, const char *what, const char *path)
 // ---------------------------------------------------------------------------
 // Locations and cache state
 // ---------------------------------------------------------------------------
-
-// Folder of KEYDB.cfg: NANUMPLAYER_DISC_KEYS_DIR, else %APPDATA%\NanumPlayer\disc.
-static char *keys_dir(void *ctx)
-{
-    wchar_t env[MAX_PATH * 2];
-    char *dir = NULL;
-    DWORD n = GetEnvironmentVariableW(L"NANUMPLAYER_DISC_KEYS_DIR", env, MP_ARRAY_SIZE(env));
-    if (n && n < MP_ARRAY_SIZE(env)) {
-        dir = mp_to_utf8(ctx, env);
-    } else {
-        char *base = NULL;
-        n = GetEnvironmentVariableW(L"APPDATA", env, MP_ARRAY_SIZE(env));
-        if (n && n < MP_ARRAY_SIZE(env)) {
-            base = mp_to_utf8(ctx, env);
-        } else {
-            wchar_t *roaming = NULL;
-            if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE,
-                                               NULL, &roaming)))
-                base = mp_to_utf8(ctx, roaming);
-            CoTaskMemFree(roaming);
-        }
-        if (base && base[0])
-            dir = talloc_asprintf(ctx, "%s\\NanumPlayer\\disc", base);
-    }
-    if (!dir || !dir[0])
-        return NULL;
-    dir = talloc_strdup(ctx, dir);
-    for (char *s = dir; *s; s++) {
-        if (*s == '/')
-            *s = '\\';
-    }
-    nanum_dl_trim_slashes(dir);
-    return dir;
-}
 
 // Age of the cache file in seconds; negative when its time lies in the future.
 static int64_t file_age_s(const struct nanum_dl_fst *st)
@@ -816,7 +783,7 @@ static const char *aacs_hint(int code, bool db_current)
 BLURAY *nanum_disc_bd_open(const char *device, struct mp_log *log, struct mp_cancel *cancel)
 {
     void *ctx = talloc_new(NULL);
-    char *dir = keys_dir(ctx);
+    char *dir = nanum_disc_keys_dir(ctx);
     char *keydb = dir ? nanum_dl_join(ctx, dir, KEYDB_FILE) : NULL;
     bool refreshed = false;
 
@@ -829,6 +796,10 @@ BLURAY *nanum_disc_bd_open(const char *device, struct mp_log *log, struct mp_can
     struct nanum_dl_fst seen = {0};
     if (keydb)
         nanum_dl_stat(keydb, &seen);
+
+    // The decryption libraries are an optional component; without a verified one
+    // libbluray finds no libaacs/libbdplus and only unprotected discs open.
+    bool component = nanum_disc_component_ready(log);
 
     BLURAY *bd = bd_open(device, keydb);
     for (;;) {
@@ -845,7 +816,10 @@ BLURAY *nanum_disc_bd_open(const char *device, struct mp_log *log, struct mp_can
 
         if (info->aacs_detected) {
             if (!info->libaacs_detected) {
-                LOG_ERR(log, "AACS encryption detected but cannot find libaacs.\n");
+                if (!component)
+                    LOG_ERR(log, "Disc decryption component is not installed: AACS.\n");
+                else
+                    LOG_ERR(log, "AACS encryption detected but cannot find libaacs.\n");
                 bd_close(bd);
                 bd = NULL;
                 break;
@@ -855,6 +829,14 @@ BLURAY *nanum_disc_bd_open(const char *device, struct mp_log *log, struct mp_can
                 int mkbv = info->aacs_mkbv;
                 bool db_current = refreshed;
                 if (!refreshed && keydb && keys_can_help(code)) {
+                    if (!nanum_disc_keys_consent()) {
+                        // Nothing is downloaded without the user's one-time agreement.
+                        bd_close(bd);
+                        bd = NULL;
+                        LOG_ERR(log, "AACS key database download needs your consent: "
+                                     "nothing was downloaded.\n");
+                        break;
+                    }
                     refreshed = true;
                     // The device must not stay open while the database changes.
                     bd_close(bd);
@@ -899,7 +881,10 @@ BLURAY *nanum_disc_bd_open(const char *device, struct mp_log *log, struct mp_can
 
         if (info->bdplus_detected) {
             if (!info->libbdplus_detected) {
-                LOG_ERR(log, "BD+ encryption detected but cannot find libbdplus.\n");
+                if (!component)
+                    LOG_ERR(log, "Disc decryption component is not installed: BD+.\n");
+                else
+                    LOG_ERR(log, "BD+ encryption detected but cannot find libbdplus.\n");
                 bd_close(bd);
                 bd = NULL;
             } else if (!info->bdplus_handled) {

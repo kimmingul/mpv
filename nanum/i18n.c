@@ -29,6 +29,7 @@
 #include "options/m_property.h"
 #include "osdep/io.h"
 #include "osdep/nanum-accel.h"
+#include "osdep/nanum-disc-component.h"
 #include "osdep/nanum-diag.h"
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
@@ -493,6 +494,7 @@ bool nanum_ui_language_command(struct MPContext *mpctx, const char *value, bool 
     // Native state that holds localized text is published again.
     nanum_models_refresh(mpctx);
     nanum_accel_refresh(mpctx);
+    nanum_disc_component_refresh(mpctx);
     nanum_youtube_publish(mpctx);
     nanum_diag_publish(mpctx);
     return *persisted;

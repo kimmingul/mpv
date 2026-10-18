@@ -62,6 +62,7 @@
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
+#include "osdep/nanum-disc-component.h"
 #include "input/input.h"
 #include "demux/packet_pool.h"
 
@@ -187,6 +188,7 @@ void mp_destroy(struct MPContext *mpctx)
     nanum_models_shutdown(mpctx);
     nanum_youtube_shutdown(mpctx);
     nanum_accel_shutdown(mpctx);
+    nanum_disc_component_shutdown(mpctx);
 
     mp_shutdown_clients(mpctx);
 

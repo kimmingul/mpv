@@ -31,7 +31,9 @@
  *               streams, timestamp_fixes, dropped_packets}  (completed only)
  *
  *  error_code: bad-args, busy, bad-device, no-media, not-a-disc,
- *              unsupported-protected, dvd-unavailable, disc-mismatch,
+ *              unsupported-protected, component-missing (copy protected and the
+ *              optional decryption component is not installed, see
+ *              nanum-disc-component.h), dvd-unavailable, disc-mismatch,
  *              bad-title, bad-destination, io, mux, cancelled,
  *              internal
  *
@@ -56,6 +58,7 @@
 #include "common/common.h"
 #include "player/command.h"
 #include "osdep/nanum-disc.h"
+#include "osdep/nanum-disc-component.h"
 
 #ifdef _WIN32
 
@@ -506,6 +509,11 @@ static bool enumerate_bd(void *ctx, struct mp_log *log, struct mp_cancel *cancel
         if (cancelled(cancel))
             return fail(e, "cancelled", N_("Cancelled."));
         char *aacs = join_path(ctx, device, "AACS");
+        if (path_is_dir(ctx, aacs) && !nanum_disc_component_ready(log))
+            return fail(e, "component-missing",
+                        N_("This Blu-ray is copy protected. The optional Blu-ray/DVD "
+                        "decryption component is not installed (Ctrl+N > Blu-ray/DVD "
+                        "decryption components)."));
         if (path_is_dir(ctx, aacs))
             return fail(e, "unsupported-protected",
                         N_("This Blu-ray is AACS protected and could not be decrypted with "
@@ -661,6 +669,7 @@ static bool enumerate_dvd(void *ctx, struct mp_log *log, struct mp_cancel *cance
                           const char *device, struct disc *d, struct err *e)
 {
     dvd_logger_cb logger = {.pf_log = dvd_log};
+    nanum_disc_component_ready(log);    // libdvdcss, if the optional component is installed
     dvd_reader_t *dvd = DVDOpen2(log, &logger, device);
     if (!dvd)
         return fail(e, "io", N_("The DVD could not be opened (see the log for details)."));
@@ -783,9 +792,15 @@ static bool enumerate_dvd(void *ctx, struct mp_log *log, struct mp_cancel *cance
 
         bool read_ok;
         if (dvd_block_scrambled(dvd, vts_nr, first_sector, &read_ok)) {
-            fail(e, "unsupported-protected",
-                 N_("This DVD is CSS protected and could not be decrypted (libdvdcss "
-                 "is unavailable or failed)."));
+            if (!nanum_disc_component_ready(log))
+                fail(e, "component-missing",
+                     N_("This DVD is CSS protected. The optional Blu-ray/DVD decryption "
+                     "component is not installed (Ctrl+N > Blu-ray/DVD decryption "
+                     "components)."));
+            else
+                fail(e, "unsupported-protected",
+                     N_("This DVD is CSS protected and could not be decrypted (libdvdcss "
+                     "is unavailable or failed)."));
             goto done;
         }
         if (!read_ok) {
@@ -802,6 +817,65 @@ done:
         ifoClose(vmg);
     DVDClose(dvd);
     return ok;
+}
+
+// Does this DVD need the (not installed) decryption component? Used by playback
+// (stream/stream_dvdnav.c) before libdvdnav opens the disc: without libdvdcss a CSS disc
+// would only fail later with unreadable or garbled blocks. A disc is judged protected when
+// the first audio/video packets of its first title set are scrambled, or cannot be read at all
+// although the disc's IFO files can.
+static bool block_scrambled(const unsigned char *b, bool *decided)
+{
+    *decided = false;
+    if (b[0] || b[1] || b[2] != 1 || b[3] != 0xBA)
+        return false;
+    size_t p = 14 + (b[13] & 7);
+    while (p + 7 <= 2048 && !b[p] && !b[p + 1] && b[p + 2] == 1) {
+        unsigned id = b[p + 3];
+        size_t len = ((size_t)b[p + 4] << 8) | b[p + 5];
+        if (id == 0xBD || (id >= 0xC0 && id <= 0xEF)) {
+            *decided = true;
+            return (b[p + 6] & 0x30) != 0;
+        }
+        p += 6 + len;
+    }
+    return false;
+}
+
+bool nanum_disc_dvd_needs_component(struct mp_log *log, const char *device)
+{
+    if (nanum_disc_component_ready(log))
+        return false;
+    dvd_logger_cb logger = {.pf_log = dvd_log};
+    dvd_reader_t *dvd = DVDOpen2(log, &logger, device);
+    if (!dvd)
+        return false;
+    bool blocked = false;
+    ifo_handle_t *vmg = ifoOpen(dvd, 0);
+    if (vmg) {
+        for (int vts = 1; vts <= 99; vts++) {
+            dvd_file_t *f = DVDOpenFile(dvd, vts, DVD_READ_TITLE_VOBS);
+            if (!f)
+                continue;
+            unsigned char block[2048];
+            bool decided = false;
+            for (int sector = 0; sector < 1024 && !decided; sector++) {
+                if (DVDReadBlocks(f, sector, 1, block) != 1) {
+                    blocked = sector == 0;      // nothing readable at all
+                    break;
+                }
+                bool scrambled = block_scrambled(block, &decided);
+                if (decided)
+                    blocked = scrambled;
+            }
+            DVDCloseFile(f);
+            if (decided || blocked)
+                break;
+        }
+        ifoClose(vmg);
+    }
+    DVDClose(dvd);
+    return blocked;
 }
 
 #else
@@ -859,7 +933,8 @@ static bool open_disc(void *ctx, struct mp_log *log, struct mp_cancel *cancel,
         ok = enumerate_bd(ctx, log, cancel, d->device, d, e);
     } else {
         ok = enumerate_bd(ctx, log, cancel, d->device, d, &e2);
-        if (!ok && strcmp(e2.code, "cancelled") && strcmp(e2.code, "unsupported-protected"))
+        if (!ok && strcmp(e2.code, "cancelled") && strcmp(e2.code, "unsupported-protected") &&
+            strcmp(e2.code, "component-missing"))
             ok = enumerate_dvd(ctx, log, cancel, d->device, d, e);
         else if (!ok)
             *e = e2;

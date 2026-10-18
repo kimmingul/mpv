@@ -31,9 +31,12 @@
 #ifndef MP_NANUM_DISC_H_
 #define MP_NANUM_DISC_H_
 
+#include "config.h"
+
 #include <stdbool.h>
 
 struct mp_cmd_ctx;
+struct mp_log;
 
 // Both are command handlers for commands defined with .spawn_thread = true and
 // .can_abort = true. Called with the core locked; they unlock it while they
@@ -44,5 +47,17 @@ struct mp_cmd_ctx;
 void nanum_disc_list(struct mp_cmd_ctx *cmd, const char *device);
 void nanum_disc_rip(struct mp_cmd_ctx *cmd, const char *device, const char *title,
                     const char *destination, const char *expected_disc_id);
+
+// Playback (stream/stream_dvdnav.c): true when the DVD at `device` is CSS protected (or
+// unreadable like one) and the optional decryption component (osdep/nanum-disc-component.h)
+// is not installed. Always false when the component is installed.
+#if defined(_WIN32) && HAVE_LIBBLURAY && HAVE_DVDNAV && HAVE_DVDA
+bool nanum_disc_dvd_needs_component(struct mp_log *log, const char *device);
+#else
+static inline bool nanum_disc_dvd_needs_component(struct mp_log *log, const char *device)
+{
+    return false;
+}
+#endif
 
 #endif

@@ -557,6 +557,7 @@ if features['win32-desktop']
                      'osdep/nanum-diag-win.c',
                      'osdep/nanum-accel-win.c',
                      'osdep/nanum-download-win.c',
+                     'osdep/nanum-disc-component-win.c',
                      'osdep/nanum-models-win.c',
                      'osdep/nanum-open-win.c',
                      'osdep/nanum-youtube-win.c',

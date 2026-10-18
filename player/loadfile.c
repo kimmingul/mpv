@@ -878,6 +878,13 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
         reinit_audio_chain(mpctx);
     } else if (type == STREAM_SUB && order >= 0 && order <= 2) {
         reinit_sub(mpctx, track);
+        // Embedded disc subtitles chosen while playing: read them from here on now.
+        if (track && !track->is_external && mpctx->playback_initialized &&
+            demuxer_select_needs_seek(track->demuxer, track->stream))
+        {
+            MP_VERBOSE(mpctx, "seeking to read the newly selected disc subtitle\n");
+            issue_refresh_seek(mpctx, MPSEEK_EXACT);
+        }
     }
 
     mp_notify(mpctx, MP_EVENT_TRACK_SWITCHED, NULL);

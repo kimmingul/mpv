@@ -4,16 +4,19 @@
  * nanum_disc_bd_open() replaces bd_open() for every consumer of libbluray
  * (playback in stream/stream_bluray.c, ripping). It does not decrypt anything
  * itself: decryption is libbluray's, through the independent libaacs/libbdplus
- * the player ships (LIBAACS_PATH/LIBBDPLUS_PATH, see osdep/nanum-startup-win.c).
+ * of the OPTIONAL disc component (LIBAACS_PATH/LIBBDPLUS_PATH, see
+ * osdep/nanum-disc-component.h); the default download has none.
  * What it adds is the key database libaacs needs, so that a cold profile plays
  * an encrypted disc with nothing prepared by the user:
  *
  *   1. bd_open(device, %APPDATA%\NanumPlayer\disc\KEYDB.cfg). A disc without
  *      AACS and BD+ never touches the network, and neither does a disc the
  *      cached database already opens.
- *   2. AACS detected but not handled for a reason a database can cure (no
+ *   2. If the component is not installed, AACS/BD+ discs fail with the error below.
+ *      AACS detected but not handled for a reason a database can cure (no
  *      file, no processing key, no host certificate, revoked certificate, no
- *      device key): the public FindVUK database
+ *      device key) AND the user agreed once (nanum_disc_keys_consent()): the public
+ *      FindVUK database
  *          https://fvonline-db.bplaced.net/fv_download.php?lang=eng
  *      is downloaded (HTTPS ZIP holding only keydb.cfg), verified and
  *      atomically published as KEYDB.cfg, and the disc is opened again. An
@@ -36,6 +39,9 @@
  * (the folder of KEYDB.cfg).
  *
  * Failure messages (log level error, one per line; the UI classifies them):
+ *   "Disc decryption component is not installed: AACS."   optional component absent
+ *   "Disc decryption component is not installed: BD+."    optional component absent
+ *   "AACS key database download needs your consent: ..."  no one-time agreement yet
  *   "AACS encryption detected but cannot find libaacs."   backend missing
  *   "BD+ encryption detected but cannot find libbdplus."  backend missing
  *   "AACS key database unavailable: <reason>"             download/verify failed

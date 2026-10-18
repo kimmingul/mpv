@@ -40,6 +40,7 @@
 #include <libavutil/intreadwrite.h>
 
 #include "osdep/io.h"
+#include "osdep/nanum-disc.h"
 
 #include "options/options.h"
 #include "common/msg.h"
@@ -1166,6 +1167,11 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
 
     priv->dvd_speed = priv->opts->speed;
     dvd_set_speed(stream, priv->filename, priv->dvd_speed);
+
+    if (!priv->probing && nanum_disc_dvd_needs_component(stream->log, priv->filename)) {
+        MP_ERR(stream, "Disc decryption component is not installed: CSS.\n");
+        return NULL;
+    }
 
     if (nav_open(stream, &priv->dvdnav, priv->filename) != DVDNAV_STATUS_OK)
         return NULL;

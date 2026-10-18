@@ -166,12 +166,25 @@ static bool pipe_error_is_fatal(DWORD error)
     return true;
 }
 
+// A client that stops reading fills the pipe; waiting for its write without a limit would
+// block this thread for good, and with it every player shutdown (which waits for all
+// clients). A write that does not complete within this time is cancelled and the client
+// gets no more replies or events.
+#define IPC_WRITE_TIMEOUT_MS 1000
+
 static DWORD ipc_write_str(struct client_arg *arg, const char *buf)
 {
     DWORD error = 0;
 
     if ((error = async_write(arg->client_h, buf, strlen(buf), &arg->write_ol)))
         goto done;
+    if (WaitForSingleObject(arg->write_ol.hEvent, IPC_WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
+        CancelIoEx(arg->client_h, &arg->write_ol);
+        GetOverlappedResult(arg->client_h, &arg->write_ol, &(DWORD){0}, TRUE);
+        MP_WARN(arg, "Client does not read from the pipe; no more replies or events are sent to it.\n");
+        error = ERROR_TIMEOUT;
+        goto done;
+    }
     if (!GetOverlappedResult(arg->client_h, &arg->write_ol, &(DWORD){0}, TRUE)) {
         error = GetLastError();
         goto done;

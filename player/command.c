@@ -87,6 +87,7 @@
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
+#include "osdep/nanum-disc-component.h"
 #include "osdep/nanum-diag.h"
 #include "osdep/nanum-disc.h"
 #include "osdep/nanum-generate.h"
@@ -7209,6 +7210,37 @@ static void cmd_nanum_cancel_accelerator_download(void *p)
     nanum_accel_cancel(cmd->mpctx);
 }
 
+// NanumPlayer: optional Blu-ray/DVD decryption component (osdep/nanum-disc-component-win.c).
+// Same contract as the accelerator commands; the state is published as
+// user-data/nanum/disc-component.
+static void cmd_nanum_disc_component_refresh(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_disc_component_refresh(cmd->mpctx);
+}
+
+static void cmd_nanum_disc_component_install(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    cmd->success = nanum_disc_component_install(cmd->mpctx, cmd->args[0].v.s);
+}
+
+static void cmd_nanum_disc_component_cancel(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    nanum_disc_component_cancel(cmd->mpctx);
+}
+
+static void cmd_nanum_disc_consent(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+#ifdef _WIN32
+    cmd->success = nanum_disc_keys_set_consent(cmd->mpctx, cmd->args[0].v.i);
+#else
+    cmd->success = false;
+#endif
+}
+
 // NanumPlayer: interface language (nanum/i18n.c). Applies at once, publishes
 // user-data/nanum/ui-language[-mode|-error] and saves ui-language.conf; fails (with the
 // reason in the error property) when the choice could not be saved.
@@ -8177,6 +8209,12 @@ const struct mp_cmd_def mp_cmds[] = {
     { "nanum-accelerator-refresh", cmd_nanum_accelerator_refresh },
     { "nanum-download-accelerator", cmd_nanum_download_accelerator },
     { "nanum-cancel-accelerator-download", cmd_nanum_cancel_accelerator_download },
+    { "nanum-disc-component-refresh", cmd_nanum_disc_component_refresh },
+    { "nanum-disc-component-install", cmd_nanum_disc_component_install,
+        { {"zip", OPT_STRING(v.s), OPTDEF_STR(""), .flags = MP_CMD_OPT_ARG} } },
+    { "nanum-disc-component-cancel", cmd_nanum_disc_component_cancel },
+    { "nanum-disc-consent", cmd_nanum_disc_consent,
+        { {"agreed", OPT_CHOICE(v.i, {"no", 0}, {"yes", 1})} } },
     { "nanum-ui-language", cmd_nanum_ui_language,
         { {"language", OPT_STRING(v.s)} } },
     { "nanum-diagnostics", cmd_nanum_diagnostics,

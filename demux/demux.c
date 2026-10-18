@@ -4630,6 +4630,28 @@ void demuxer_refresh_track(struct demuxer *demuxer, struct sh_stream *stream,
     mp_mutex_unlock(&in->lock);
 }
 
+// A disc demuxer cannot refresh seek (it is only partially seekable), so a subtitle stream
+// selected during playback gets packets only from the read position on, which is the whole
+// read-ahead (minutes with the AI) in front of playback. Its embedded subtitles then appear
+// only that much later, and not at all when seeking back into what was read before. The
+// player seeks to the current position instead (disc demuxers never seek in the cache).
+// Not during disc navigation (menus are not read ahead), and never for the AI virtual
+// streams, whose events are injected at the playback position anyway.
+bool demuxer_select_needs_seek(struct demuxer *demuxer, struct sh_stream *stream)
+{
+    struct demux_internal *in = demuxer->in;
+    if (!stream || stream->type != STREAM_SUB)
+        return false;
+    mp_mutex_lock(&in->lock);
+    bool r = in->d_thread->partially_seekable && !in->nav_active;
+    for (int i = 0; i < NANUM_INPUTS; i++) {
+        if (in->nanum_sh[i] == stream)
+            r = false;
+    }
+    mp_mutex_unlock(&in->lock);
+    return r;
+}
+
 // This is for demuxer implementations only. demuxer_select_track() sets the
 // logical state, while this function returns the actual state (in case the
 // demuxer attempts to cache even unselected packets for track switching - this

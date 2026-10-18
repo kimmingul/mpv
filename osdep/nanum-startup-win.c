@@ -30,6 +30,7 @@
 #include "osdep/nanum-models.h"
 #include "osdep/nanum-youtube.h"
 #include "osdep/nanum-accel.h"
+#include "osdep/nanum-disc-component.h"
 #include "osdep/nanum-diag.h"
 #include "player/command.h"
 #include "player/core.h"
@@ -46,16 +47,6 @@ static const char DEFAULT_CONF[] =
     "# Language of the AI subtitles; default: your Windows display language. Ctrl+N changes it too.\n"
     "# nanum-target-language=Korean\n"
     "# Blu-ray: set the drive, e.g.  bluray-device=E:\n";
-
-static wchar_t *wjoin(void *ctx, const wchar_t *a, const wchar_t *b)
-{
-    size_t la = wcslen(a), lb = wcslen(b);
-    wchar_t *r = talloc_array(ctx, wchar_t, la + lb + 2);
-    wcscpy(r, a);
-    r[la] = L'\\';
-    wcscpy(r + la + 1, b);
-    return r;
-}
 
 // Directory of the executable: where the Windows loader looks first for DLLs.
 static wchar_t *exe_dir(void *ctx)
@@ -103,12 +94,11 @@ void nanum_startup_environment(void)
     void *tmp = talloc_new(NULL);
     wchar_t *root = app_root(tmp);
     if (root) {
-        // libbluray appends ".dll". Pin both loaders to our independent
-        // libraries; old renamed libmmbd copies and installation discovery
-        // must never reintroduce a console-process dependency.
-        wchar_t *dir = wjoin(tmp, root, L"disc");
-        _wputenv_s(L"LIBAACS_PATH", wjoin(tmp, dir, L"libaacs"));
-        _wputenv_s(L"LIBBDPLUS_PATH", wjoin(tmp, dir, L"libbdplus"));
+        // libbluray appends ".dll". Both loaders are pinned to a place where nothing
+        // exists until the optional disc component is verified (osdep/nanum-disc-component-win.c);
+        // old renamed libmmbd copies and installation discovery must never reintroduce a
+        // console-process dependency, and no decryption library is picked up by accident.
+        nanum_disc_component_environment(root);
     }
     talloc_free(tmp);
 }
@@ -253,6 +243,8 @@ void nanum_startup_defaults(struct MPContext *mpctx)
     // the application folder, optional CUDA components). --nanum-ai-dll stays
     // empty here: setting it is an explicit user override of that choice.
     nanum_accel_startup(mpctx, root);
+    // Blu-ray/DVD decryption is an optional component (osdep/nanum-disc-component-win.c).
+    nanum_disc_component_startup(mpctx, root);
     // Models are optional downloads. A model file next to the application
     // stays in use; otherwise the persistent user model folder is the default
     // (see osdep/nanum-models-win.c), so a later download is picked up by the
