@@ -235,7 +235,7 @@ void nanum_startup_defaults(struct MPContext *mpctx)
     add_opt(&text, "idle", "yes");
     add_opt(&text, "force-window", "yes");
     add_opt(&text, "window-corners", "round");
-    add_opt(&text, "title", "${?media-title:${media-title} - }NanumPlayer");
+    add_opt(&text, "title", "${?media-title:${media-title} - NanumPlayer " NANUM_VERSION "}${!media-title:NanumPlayer}");
 
     // AI engine.
     add_opt(&text, "nanum", "yes");
